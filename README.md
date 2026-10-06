@@ -98,10 +98,22 @@ The service warms the blockhash cache before receiving signals and refreshes it
 in the background. Entries are valid for less than two seconds from request start,
 with more than 20 blocks of validity remaining; refreshes have a 1.5-second timeout.
 The hot path requires a fresh cached blockhash. Wallet balances refresh in the
-background every 250 ms after each refresh completes, for SOL and configured token
-accounts. Input balances must be cached before live execution can proceed.
-The output baseline uses the cache when available. Post-confirmation reconciliation
-reads balances from RPC. Swap accounts come from the source instruction, with
+background 500 ms after each refresh completes, with up to eight account reads
+in flight. SOL and token accounts with positive or uninitialized balances are
+refreshed; newly encountered token accounts join this set automatically. Zero
+balances remain cached but are not polled while idle.
+
+Balance entries expire one second after request start. A cache miss or stale
+entry triggers a targeted RPC balance read for that account, including mints
+absent from configuration. A missing token account is cached as zero only after
+RPC confirms its absence; transport failures and invalid balances remain errors.
+Submission and confirmation invalidate the affected token balances and SOL.
+Post-confirmation input/output reads immediately update the cache, and token-to-token
+copies also refresh SOL to account for fees. Failed landed transactions refresh
+SOL as well. Older in-flight reads cannot overwrite a newer update or refill an
+invalidated entry. Reconciliation always reads RPC, regardless of cache freshness.
+
+Swap accounts come from the source instruction, with
 copier-specific accounts rewritten locally. No pool state or route catalog is
 loaded, cached, scanned, or refreshed.
 Sender connections are pinged on startup and every 30 seconds.

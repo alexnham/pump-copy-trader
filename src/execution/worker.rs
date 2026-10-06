@@ -307,6 +307,13 @@ impl ExecutionWorker {
         timings
             .values
             .insert("db_pre_send_us", timings.database.total_us());
+        self.invalidate_balances(
+            sized.intent.input_asset,
+            &input_account,
+            sized.intent.output_asset,
+            &output_account,
+        )
+        .await?;
         timings.stage("sender_request_ms");
         timings.mark("sender_request_started_ms");
         timings.since_receipt("receipt_to_send_start_ms");
@@ -391,7 +398,20 @@ impl ExecutionWorker {
             .await?;
         let slot_delta = confirmation.slot.saturating_sub(observed.slot);
         timings.values.insert("slot_delta", slot_delta);
+        self.invalidate_balances(
+            sized.intent.input_asset,
+            &input_account,
+            sized.intent.output_asset,
+            &output_account,
+        )
+        .await?;
         if let Some(error) = confirmation.error {
+            if let Err(balance_error) = self
+                .asset_balance_network(AssetId::NativeSol, &self.signer.pubkey())
+                .await
+            {
+                warn!(%balance_error, %source_signature, "cannot refresh SOL balance after failed landed transaction");
+            }
             self.store
                 .update_attempt(&source_signature, AttemptStatus::Failed, Some(&error))
                 .await?;
@@ -399,9 +419,20 @@ impl ExecutionWorker {
         }
 
         timings.stage("reconciliation_ms");
-        let input_after = self
-            .asset_balance_network(sized.intent.input_asset, &input_account)
-            .await?;
+        let (input_after, output_after, _) = tokio::try_join!(
+            self.asset_balance_network(sized.intent.input_asset, &input_account),
+            self.asset_balance_network(sized.intent.output_asset, &output_account),
+            async {
+                if sized.intent.input_asset != AssetId::NativeSol
+                    && sized.intent.output_asset != AssetId::NativeSol
+                {
+                    self.asset_balance_network(AssetId::NativeSol, &self.signer.pubkey())
+                        .await
+                } else {
+                    Ok(0)
+                }
+            }
+        )?;
         let spent = available.checked_sub(input_after).ok_or_else(|| {
             CopyTraderError::Execution("input balance increased after swap".to_owned())
         })?;
@@ -415,9 +446,6 @@ impl ExecutionWorker {
             );
         }
 
-        let output_after = self
-            .asset_balance_network(sized.intent.output_asset, &output_account)
-            .await?;
         let native_cost_adjustment = if matches!(sized.intent.output_asset, AssetId::NativeSol) {
             let fee = self
                 .backend
@@ -522,51 +550,46 @@ impl ExecutionWorker {
         })
     }
 
-    async fn cached_asset_balance(&self, _asset: AssetId, token_account: &Pubkey) -> Result<u64> {
-        if let Some(balance) = self.balance_cache.get(token_account).await {
-            return Ok(balance);
+    async fn invalidate_balances(
+        &self,
+        input: AssetId,
+        input_account: &Pubkey,
+        output: AssetId,
+        output_account: &Pubkey,
+    ) -> Result<()> {
+        self.balance_cache.invalidate(&self.signer.pubkey()).await?;
+        for (asset, account) in [(input, input_account), (output, output_account)] {
+            if asset != AssetId::NativeSol {
+                self.balance_cache.invalidate(account).await?;
+            }
         }
-        #[cfg(test)]
-        {
-            return self.asset_balance_network(_asset, token_account).await;
-        }
-        #[cfg(not(test))]
-        {
-            let _ = token_account;
-            Err(CopyTraderError::Execution(format!(
-                "balance cache is not ready for account {token_account}"
-            )))
-        }
+        Ok(())
+    }
+
+    async fn cached_asset_balance(&self, asset: AssetId, token_account: &Pubkey) -> Result<u64> {
+        self.balance_cache
+            .get_or_fetch(
+                self.backend.rpc(),
+                asset,
+                self.signer.pubkey(),
+                *token_account,
+            )
+            .await
     }
 
     async fn asset_balance_network(&self, asset: AssetId, token_account: &Pubkey) -> Result<u64> {
-        if matches!(asset, AssetId::NativeSol) {
-            return self
-                .backend
-                .rpc()
-                .get_balance(&self.signer.pubkey())
-                .await
-                .map_err(|error| {
-                    CopyTraderError::Execution(format!("failed to read SOL balance: {error}"))
-                });
-        }
-        self.backend
-            .rpc()
-            .get_token_account_balance(token_account)
+        self.balance_cache
+            .fetch(
+                self.backend.rpc(),
+                asset,
+                self.signer.pubkey(),
+                *token_account,
+            )
             .await
-            .map_err(|error| {
-                CopyTraderError::Execution(format!("failed to read token balance: {error}"))
-            })?
-            .amount
-            .parse::<u64>()
-            .map_err(|error| CopyTraderError::Execution(format!("invalid token balance: {error}")))
     }
 
     async fn asset_balance_or_zero(&self, asset: AssetId, token_account: &Pubkey) -> Result<u64> {
-        match self.cached_asset_balance(asset, token_account).await {
-            Ok(balance) => Ok(balance),
-            Err(_) => Ok(0),
-        }
+        self.cached_asset_balance(asset, token_account).await
     }
 }
 
@@ -1195,6 +1218,8 @@ mod unsupported_tests {
                 Duration::from_secs(2),
             )),
         );
+        let cache = worker.balance_cache.clone();
+        let copier = worker.signer.pubkey();
         let mut observations = Vec::new();
         for id in 1..=6 {
             let mut observed = observation(source_wallet, id);
@@ -1222,7 +1247,17 @@ mod unsupported_tests {
             }
             observations.push(observed);
         }
-        observations.push(observation(source_wallet, 7));
+        let valid_observation = observation(source_wallet, 7);
+        let output_mint: Pubkey = valid_observation
+            .meta
+            .post_token_balances
+            .as_ref()
+            .expect("balances")[0]
+            .mint
+            .parse()
+            .expect("mint");
+        let copied_output = associated_token_address(&copier, &output_mint, &spl_token::id());
+        observations.push(valid_observation);
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         for observed in observations {
             store.record_observation(&observed).await.expect("journal");
@@ -1282,6 +1317,17 @@ mod unsupported_tests {
             valid.error
         );
         assert_eq!(valid.landed_slot, Some(43));
+        assert_eq!(cache.get(&copier).await, Some(1_000_000_000));
+        assert_eq!(
+            cache.get(&copied_output).await,
+            Some(1000),
+            "newly acquired token is cached for its next sell"
+        );
+        assert_eq!(
+            server.count("getTokenAccountBalance"),
+            2,
+            "baseline and reconciliation only"
+        );
         assert_eq!(server.count("sendTransaction"), 1);
         assert_eq!(server.count("simulateTransaction"), 0);
         assert_eq!(server.count("getProgramAccounts"), 0);
