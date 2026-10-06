@@ -1,11 +1,4 @@
-use std::{
-    str::FromStr,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
@@ -43,11 +36,9 @@ pub struct MainnetClient {
     rpc_url: Url,
     sender_url: Url,
     tip_lamports: u64,
-    source_direct: bool,
     fixed_priority_fee: u64,
     http: Arc<HttpTransport>,
     blockhash: super::blockhash::BlockhashCache,
-    cached_priority_fee: AtomicU64,
 }
 
 impl MainnetClient {
@@ -57,24 +48,13 @@ impl MainnetClient {
             rpc_url,
             sender_url: config.sender_url.clone(),
             tip_lamports: config.tip_lamports,
-            source_direct: config.source_direct,
             fixed_priority_fee: config
                 .fixed_priority_fee_micro_lamports
                 .unwrap_or(config.max_priority_fee_micro_lamports)
                 .min(config.max_priority_fee_micro_lamports),
             http,
             blockhash: super::blockhash::BlockhashCache::default(),
-            cached_priority_fee: AtomicU64::new(
-                config
-                    .fixed_priority_fee_micro_lamports
-                    .unwrap_or(config.max_priority_fee_micro_lamports)
-                    .min(config.max_priority_fee_micro_lamports),
-            ),
         }
-    }
-
-    pub const fn source_direct(&self) -> bool {
-        self.source_direct
     }
 
     pub async fn warm(&self) -> Result<u64> {
@@ -90,15 +70,11 @@ impl MainnetClient {
         self.blockhash.cached()
     }
 
-    pub fn cached_priority_fee(&self) -> u64 {
-        self.cached_priority_fee.load(Ordering::Relaxed)
-    }
-
     /// Run alongside the service; dropping this future stops refreshes.
     pub async fn keep_blockhash_fresh(&self) {
         loop {
             if self.blockhash.refresh(&self.rpc).await.is_err() {
-                warn!("blockhash refresh failed; stale cache reads will retry RPC");
+                warn!("blockhash refresh failed; stale entries remain unusable");
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
@@ -136,14 +112,8 @@ impl MainnetClient {
         source_signature: &Signature,
         compute_limit: u32,
         mut instructions: Vec<Instruction>,
-        fee_candidate: &Transaction,
     ) -> Result<Vec<Instruction>> {
-        let _ = fee_candidate;
-        let price = if self.source_direct {
-            self.fixed_priority_fee
-        } else {
-            self.cached_priority_fee()
-        };
+        let price = self.fixed_priority_fee;
         let tip = choose_tip_account(source_signature)?;
         debug!(compute_limit, priority_fee = price, tip_lamports = self.tip_lamports, tip_account = %tip, "mainnet fees selected");
         let mut finalized = Vec::with_capacity(instructions.len() + 3);

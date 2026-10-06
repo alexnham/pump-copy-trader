@@ -35,14 +35,14 @@ excluded from Git.
 ## Supported routes and unsupported outcomes
 
 Pump.fun supports the existing legacy, V2, and V3 buy/sell instruction rewrites,
-including recognized exact-quote-input buys. These bonding-curve copies require
-`mainnet.skip = true`. PumpSwap retains source-direct copying and its pool-based
-quote/discovery route. Other DEX execution and Surfpool are excluded.
+including recognized exact-quote-input buys. Both protocols build
+only from decoded source instructions. Pool caches, account scans, quotes, and
+route discovery have been removed. Other DEX execution and Surfpool are excluded.
 
 A source must contain one recognized Pump trade, attributable to the tracked
 wallet's economic input and output. Unknown or malformed Pump layouts, unsupported
 venues or token capabilities, ambiguous trades, and multiple swaps end cleanly
-with `unsupported`. A non-Pump source never becomes a Pump copy through discovery.
+with `unsupported`. A non-Pump source cannot become a Pump copy.
 
 The journal records the source signature, slot, structured reason, and available
 timings. An already reserved attempt also becomes `unsupported`. No copy signature
@@ -64,8 +64,15 @@ skip = true
 fixed_priority_fee_micro_lamports = 100000
 ```
 
-`source_direct` remains an alias for `skip`; configure only one. The fixed fee
-must not exceed `max_priority_fee_micro_lamports`. Settings take effect on restart.
+Source-instruction copying is always enabled. `skip` defaults to true, and
+`source_direct` remains an alias; configure only one. Explicit `skip = false` is
+rejected because quote/discovery routing no longer exists. The fixed fee must
+not exceed `max_priority_fee_micro_lamports`. Settings take effect on restart.
+
+`[routing]` now contains only `timeout_ms` (default 2000), the source-builder
+budget. `race_timeout_ms` remains a timeout alias for older configurations.
+Remove `pool_refresh_seconds` and `max_pools_per_dex`; the local and example
+configuration files have already been migrated.
 Source-direct output uses `floor(copy_input * source_output / source_input)` and
 configured slippage. Invalid estimates and overflow are rejected. This uses the
 source trade's price rather than a fresh quote.
@@ -82,9 +89,8 @@ for the copier when present in the source instruction.
 Sizing, token policy, account rewriting, signing, duplicate reservations,
 confirmation, and balance reconciliation remain enabled.
 
-The extracted baseline skips transaction simulation and pre-send fee checks in
-both routing modes. `skip = false` enables PumpSwap quotes and pool discovery;
-it does not restore simulation. The journal records
+The source-instruction path skips transaction simulation and pre-send fee checks.
+The journal records
 `{"skipped":true,"reason":"hot_path_no_simulation"}`. Sender uses
 `skipPreflight=true` and disables retries. Failed landed transactions can cost fees.
 
@@ -95,9 +101,9 @@ The hot path requires a fresh cached blockhash. Wallet balances refresh in the
 background every 250 ms after each refresh completes, for SOL and configured token
 accounts. Input balances must be cached before live execution can proceed.
 The output baseline uses the cache when available. Post-confirmation reconciliation
-reads balances from RPC. Pool catalogs warm and refresh only in quoted mode
-(`mainnet.skip = false`). Source-direct mode starts no pool scans and copies the
-decoded source instruction even when its pool is absent from the catalog.
+reads balances from RPC. Swap accounts come from the source instruction, with
+copier-specific accounts rewritten locally. No pool state or route catalog is
+loaded, cached, scanned, or refreshed.
 Sender connections are pinged on startup and every 30 seconds.
 
 Token admission defaults to an allowlist. All-token admission requires an explicit
@@ -114,7 +120,8 @@ removed by a fork.
 
 ## SQLite journal and timings
 
-Startup applies the retained additive migrations. Historical schema objects for
+Startup applies the retained additive migrations. The historical `quoted_output`
+column stores the source-price output estimate. Historical schema objects for
 the original backend remain for migration compatibility but have no seeding
 runtime in this service. Connections use WAL and `synchronous=FULL`.
 
@@ -174,5 +181,5 @@ node --check db_ui/static/app.js
 ```
 
 Rust tests use temporary databases and loopback mock RPC servers. They cover Pump
-rewrites, bounded routing, recovery, duplicate protection, unsupported outcomes,
+rewrites, source-only routing, recovery, duplicate protection, unsupported outcomes,
 and malformed source payloads without submitting to a live network.

@@ -1,8 +1,6 @@
 mod backend;
 pub mod cache;
 mod confirm;
-pub(crate) mod preflight;
-pub(crate) mod simulate;
 mod sizing;
 mod worker;
 

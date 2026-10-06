@@ -61,7 +61,7 @@ class DatabaseTests(unittest.TestCase):
                 (2, 'pump_fun', 'landed', {'mint_from_source': 1, 'mint_read_ms': 0, 'preparation_ms': 4, 'receipt_to_send_start_ms': 8}),
                 (3, 'pump_fun', 'landed', {'mint_from_source': 1, 'mint_read_ms': 0, 'preparation_ms': 6, 'receipt_to_send_start_ms': 12}),
                 (4, 'pump_fun', 'landed', {'preparation_ms': 80, 'receipt_to_send_start_ms': 100}),
-                (5, 'pump_swap', 'landed', {'route_quote_ms': 60, 'receipt_to_send_start_ms': 120}),
+                (5, 'pump_swap', 'landed', {'route_instruction_build_ms': 60, 'receipt_to_send_start_ms': 120}),
                 (6, 'pump_fun', 'failed', {'mint_from_source': 1, 'receipt_to_send_start_ms': 1000}),
             ]:
                 signature = f'source-{number}'
@@ -76,8 +76,8 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(groups['pump_fun_source']['metrics']['preparation_ms']['average'], 5.0)
         self.assertEqual(groups['pump_fun_rpc']['count'], 1)
         self.assertNotIn('mint_read_ms', groups['pump_fun_rpc']['metrics'])
-        self.assertEqual(groups['quoted_route']['count'], 1)
-        self.assertEqual(groups['quoted_route']['metrics']['route_quote_ms']['average'], 60.0)
+        self.assertEqual(groups['pump_swap_source']['count'], 1)
+        self.assertEqual(groups['pump_swap_source']['metrics']['route_instruction_build_ms']['average'], 60.0)
 
     def test_read_only_queries_and_no_external_database_access(self):
         self.assertEqual(self.database.query('SELECT count(*) AS n FROM copy_attempts')['rows'],[[1]])

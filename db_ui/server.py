@@ -134,10 +134,10 @@ class Database:
 
     def flow_stats(self):
         metrics = ("ingestion_queue_ms", "preparation_ms", "mint_read_ms", "route_wall_ms",
-                   "route_quote_ms", "receipt_to_send_start_ms", "sender_request_ms",
+                   "route_instruction_build_ms", "receipt_to_send_start_ms", "sender_request_ms",
                    "confirmation_ms", "slot_delta")
         groups = {name: {"count": 0, "metrics": {}} for name in
-                  ("pump_fun_source", "pump_fun_rpc", "quoted_route")}
+                  ("pump_fun_source", "pump_fun_rpc", "pump_swap_source")}
         with self.connect() as connection:
             sources = {column["name"] for column in self.columns(connection, "source_transactions")}
             copies = {column["name"] for column in self.columns(connection, "copy_attempts")}
@@ -158,8 +158,8 @@ class Database:
                     continue
                 if dex == "pump_fun":
                     name = "pump_fun_source" if timings.get("mint_from_source") == 1 else "pump_fun_rpc"
-                elif "route_quote_ms" in timings:
-                    name = "quoted_route"
+                elif dex == "pump_swap":
+                    name = "pump_swap_source"
                 else:
                     continue
                 group = groups[name]

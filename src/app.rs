@@ -1,7 +1,7 @@
 use std::{env, path::Path, str::FromStr, sync::Arc};
 
 use solana_sdk::signature::{Keypair, Signature, Signer, read_keypair_file};
-use tokio::{sync::mpsc, time::MissedTickBehavior};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::{
@@ -65,62 +65,22 @@ async fn run_service(config: Arc<AppConfig>, store: Store) -> Result<()> {
         &config.signal.commitment,
     );
     let decoder = TransactionDecoder::new(config.signal.wallet);
-    let discovery_rpc = Arc::new(transport.solana_rpc(&helius_http));
+    let execution_rpc = Arc::new(transport.solana_rpc(&helius_http));
     let allowed_mints = config
         .tokens
         .iter()
         .map(|rule| rule.mint)
         .collect::<Vec<_>>();
-    let router = Arc::new(Router::supported(
-        discovery_rpc.clone(),
-        config.routing.max_pools_per_dex,
-        std::time::Duration::from_millis(config.routing.race_timeout_ms),
+    let router = Arc::new(Router::new(
+        execution_rpc.clone(),
+        std::time::Duration::from_millis(config.routing.timeout_ms),
     ));
     let balance_cache = WalletBalanceCache::default();
     tokio::spawn(balance_cache.clone().run(
-        discovery_rpc.clone(),
+        execution_rpc.clone(),
         signer.pubkey(),
         allowed_mints.clone(),
     ));
-    if !config
-        .mainnet
-        .as_ref()
-        .is_some_and(|mainnet| mainnet.source_direct)
-    {
-        let mut warm_mints = Vec::with_capacity(allowed_mints.len() + 1);
-        warm_mints.push(solana_sdk::pubkey!(
-            "So11111111111111111111111111111111111111112"
-        ));
-        warm_mints.extend(allowed_mints.iter().copied());
-        let warm_configured_pairs = !allowed_mints.is_empty() && !config.allows_all_tokens();
-        let warm_sol_pools = allowed_mints.is_empty() || config.allows_all_tokens();
-        if warm_configured_pairs || warm_sol_pools {
-            let initial_router = router.clone();
-            let initial_mints = warm_mints.clone();
-            tokio::spawn(async move {
-                info!(
-                    configured_pairs = warm_configured_pairs,
-                    sol_pools = warm_sol_pools,
-                    "initial route catalog warming running in background"
-                );
-                if warm_configured_pairs
-                    && let Err(error) = initial_router.warm(&initial_mints).await
-                {
-                    warn!(%error, "initial configured pair warming failed");
-                }
-                if warm_sol_pools && let Err(error) = initial_router.warm_sol_pools().await {
-                    warn!(%error, "initial SOL pool warming failed");
-                }
-                info!("initial route catalog warming complete");
-            });
-        }
-        spawn_router_maintenance(
-            router.clone(),
-            warm_mints,
-            !allowed_mints.is_empty() && !config.allows_all_tokens(),
-            config.routing.pool_refresh_seconds,
-        );
-    }
     let worker = ExecutionWorker::new(
         config.clone(),
         signer,
@@ -160,31 +120,6 @@ async fn run_service(config: Arc<AppConfig>, store: Store) -> Result<()> {
             Ok(())
         }
     }
-}
-
-fn spawn_router_maintenance(
-    router: Arc<Router>,
-    allowed_mints: Vec<solana_sdk::pubkey::Pubkey>,
-    warm_configured_pairs: bool,
-    pool_refresh_seconds: u64,
-) {
-    tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(pool_refresh_seconds));
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            info!("periodic router maintenance started");
-            if warm_configured_pairs && let Err(error) = router.warm(&allowed_mints).await {
-                warn!(%error, "periodic pool catalog refresh failed");
-            }
-            if let Err(error) = router.warm_sol_pools().await {
-                warn!(%error, "periodic SOL pool warming failed");
-            }
-            info!("periodic router maintenance complete");
-        }
-    });
 }
 
 async fn doctor(config: &AppConfig, store: &Store) -> Result<()> {

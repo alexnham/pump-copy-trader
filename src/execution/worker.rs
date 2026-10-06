@@ -22,7 +22,7 @@ use crate::{
         ExecutionBackend, cache::WalletBalanceCache, confirm::wait_for_confirmation,
         sizing::SizingPolicy,
     },
-    routing::{PrefetchedSource, Router, RoutingInputs, RoutingTimings, pump_fun},
+    routing::{Router, RoutingTimings, pump_fun},
     signal::QueuedObservation,
     storage::{DatabaseTimings, Store, TimingWriter},
     token::{
@@ -200,29 +200,11 @@ impl ExecutionWorker {
             return Ok(());
         }
         let mut routing_timings = RoutingTimings::default();
-        let prefetched = if self
-            .backend
-            .mainnet()
-            .is_some_and(|client| client.source_direct())
-        {
-            None
-        } else {
-            self.router
-                .prefetch_source(&intent, &routing_timings.stages)
-        };
-        timings.mark("cache_lookup_complete_ms");
-        let direct_mints = if self
-            .backend
-            .mainnet()
-            .is_some_and(|client| client.source_direct())
-        {
-            direct_pump_fun_mints(&intent, observed.meta.post_token_balances.as_deref())
-        } else {
-            None
-        };
+        let direct_mints =
+            direct_pump_fun_mints(&intent, observed.meta.post_token_balances.as_deref());
         let (intent_write, reads) = tokio::join!(
             self.store.mark_intent(&source_signature, &intent),
-            self.initial_reads(&intent, prefetched.as_ref(), direct_mints),
+            self.initial_reads(&intent, direct_mints),
         );
         intent_write?;
         let InitialReads {
@@ -278,31 +260,20 @@ impl ExecutionWorker {
         let started = Instant::now();
         let result = self
             .router
-            .race_prepared(
+            .build(
                 &sized,
                 self.signer.as_ref(),
                 self.backend.as_ref(),
                 self.config.execution.slippage_bps,
-                RoutingInputs {
-                    mint_infos: (&input_info, &output_info),
-                    source: prefetched,
-                },
                 &mut routing_timings,
             )
             .await;
         timings.finish();
-        let route_latency_ms =
-            CopyTimings::millis(started.elapsed()).saturating_sub(routing_timings.discovery_ms);
+        let route_latency_ms = CopyTimings::millis(started.elapsed());
         timings
             .values
             .insert("route_wall_ms", CopyTimings::millis(started.elapsed()));
         timings.values.insert("route_ms", route_latency_ms);
-        timings
-            .values
-            .insert("discovery_ms", routing_timings.discovery_ms);
-        timings
-            .values
-            .insert("source_route_ms", routing_timings.source_route_ms);
         timings.values.extend(routing_timings.stages.snapshot());
         let winner = result?;
         timings.mark("quote_complete_ms");
@@ -511,7 +482,6 @@ impl ExecutionWorker {
     async fn initial_reads(
         &self,
         intent: &TradeIntent,
-        source: Option<&PrefetchedSource>,
         direct_mints: Option<(MintInfo, MintInfo)>,
     ) -> Result<InitialReads> {
         let preparation = async {
@@ -541,16 +511,8 @@ impl ExecutionWorker {
                 }
             )
         };
-        tokio::pin!(preparation);
         let (((input_info, output_info), mint_read_ms, mint_from_source), native_balance) =
-            if let Some(source) = source {
-                tokio::select! {
-                    result = &mut preparation => result?,
-                    _ = source.account.clone() => preparation.await?,
-                }
-            } else {
-                preparation.await?
-            };
+            preparation.await?;
         Ok(InitialReads {
             input_info,
             output_info,
@@ -558,26 +520,6 @@ impl ExecutionWorker {
             mint_read_ms,
             mint_from_source,
         })
-    }
-
-    #[cfg(test)]
-    async fn post_route_reads(
-        &self,
-        message: &solana_sdk::message::Message,
-        output_asset: AssetId,
-        output_account: &Pubkey,
-    ) -> Result<(u64, u64, u64)> {
-        let owner = self.signer.pubkey();
-        let (fee, (available, output)) = tokio::try_join!(
-            super::preflight::transaction_fee(self.backend.rpc(), message),
-            super::preflight::read_balances(
-                self.backend.rpc(),
-                &owner,
-                output_asset,
-                output_account
-            )
-        )?;
-        Ok((fee, available, output))
     }
 
     async fn cached_asset_balance(&self, _asset: AssetId, token_account: &Pubkey) -> Result<u64> {
@@ -856,9 +798,8 @@ mod timing_tests {
             backend,
             TokenSafetyClient::new(&server.url, &transport),
             TransactionDecoder::new(config.signal.wallet),
-            Arc::new(Router::supported(
+            Arc::new(Router::new(
                 Arc::new(transport.solana_rpc(&server.url)),
-                4,
                 Duration::from_secs(2),
             )),
         );
@@ -884,10 +825,7 @@ mod timing_tests {
                 has_transfer_fee: false,
             },
         );
-        let reads = worker
-            .initial_reads(&intent, None, Some(infos))
-            .await
-            .unwrap();
+        let reads = worker.initial_reads(&intent, Some(infos)).await.unwrap();
         assert!(reads.mint_from_source);
         assert_eq!(reads.mint_read_ms, 0);
         assert_eq!(reads.native_balance, Some(1_000_000));
@@ -895,7 +833,7 @@ mod timing_tests {
     }
 
     #[tokio::test]
-    async fn initial_reads_overlap_and_do_not_wait_for_slow_or_failed_source() {
+    async fn initial_mint_and_balance_reads_overlap_and_preserve_rpc_failures() {
         use crate::{
             config::{HttpConfig, MainnetConfig},
             domain::{DexKind, SourcePool},
@@ -904,14 +842,7 @@ mod timing_tests {
             test_rpc::{TestRpc, mint_account},
         };
         use serde_json::json;
-        for scenario in [
-            "native",
-            "token",
-            "slow_source",
-            "bad_source",
-            "mint_failure",
-            "balance_failure",
-        ] {
+        for scenario in ["native", "token", "mint_failure", "balance_failure"] {
             let server = TestRpc::start(move |request| {
                 let value = match request["method"].as_str().unwrap() {
                     "getVersion" => return json!({"solana-core":"3.1.0","feature-set":1}),
@@ -923,22 +854,9 @@ mod timing_tests {
                         return json!({"error":{"code":-32602,"message":"balance failure"}});
                     }
                     "getBalance" => json!(1000000),
-                    "getAccountInfo" => {
-                        assert_eq!(request["params"][1]["minContextSlot"], 42);
-                        if scenario == "bad_source" {
-                            json!(null)
-                        } else {
-                            mint_account()
-                        }
-                    }
                     other => panic!("unexpected RPC {other}"),
                 };
-                let delay = if scenario == "slow_source" && request["method"] == "getAccountInfo" {
-                    1000
-                } else {
-                    75
-                };
-                json!({"test_delay_ms":delay,"test_result":{"context":{"slot":42},"value":value}})
+                json!({"test_delay_ms":75,"test_result":{"context":{"slot":42},"value":value}})
             })
             .await;
             let transport = HttpTransport::new(&HttpConfig::default()).unwrap();
@@ -963,9 +881,8 @@ mod timing_tests {
                 backend,
                 TokenSafetyClient::new(&server.url, &transport),
                 TransactionDecoder::new(config.signal.wallet),
-                Arc::new(Router::supported(
+                Arc::new(Router::new(
                     Arc::new(transport.solana_rpc(&server.url)),
-                    4,
                     Duration::from_secs(2),
                 )),
             );
@@ -986,14 +903,12 @@ mod timing_tests {
                 source_input_amount: 100,
                 source_output_amount: 100,
             };
-            let stages = crate::routing::RouteStages::default();
-            let source = worker.router.prefetch_source(&intent, &stages);
             let result = tokio::time::timeout(
                 Duration::from_millis(700),
-                worker.initial_reads(&intent, source.as_ref(), None),
+                worker.initial_reads(&intent, None),
             )
             .await
-            .expect("initial reads stalled on source");
+            .expect("initial reads stalled");
             assert_eq!(
                 result.is_err(),
                 matches!(scenario, "mint_failure" | "balance_failure"),
@@ -1019,109 +934,7 @@ mod timing_tests {
                     if scenario == "token" { 0 } else { 1 }
                 );
             }
-            if scenario == "slow_source" {
-                assert!(!stages.snapshot().contains_key("source_pool_read_ms"));
-            }
-            drop(source);
             assert_eq!(server.count("sendTransaction"), 0);
-        }
-    }
-
-    #[tokio::test]
-    async fn post_route_reads_overlap_and_preserve_fee_errors() {
-        use crate::{
-            config::{HttpConfig, MainnetConfig},
-            http::HttpTransport,
-            mainnet::MainnetClient,
-            test_rpc::TestRpc,
-        };
-        use serde_json::json;
-        for fail_fee in [false, true] {
-            let server = TestRpc::start(move |request| {
-                let value = match request["method"].as_str().expect("method") {
-                    "getVersion" => return json!({"solana-core":"3.1.0","feature-set":1}),
-                    "getFeeForMessage" if fail_fee => return json!({"error":{"code":-32602,"message":"fee unavailable"}}),
-                    "getFeeForMessage" => json!(5000),
-                    "getBalance" => json!(1000000),
-                    "getTokenAccountBalance" => json!({"amount":"123","decimals":6,"uiAmount":0.000123,"uiAmountString":"0.000123"}),
-                    other => panic!("unexpected method {other}"),
-                };
-                json!({"test_delay_ms":75,"test_result":{"context":{"slot":42},"value":value}})
-            }).await;
-            let transport = HttpTransport::new(&HttpConfig::default()).expect("transport");
-            let mainnet_config = MainnetConfig {
-                source_direct: false,
-                fixed_priority_fee_micro_lamports: None,
-                sender_url: server.url.clone(),
-                tip_lamports: 5000,
-                priority_level: "High".to_owned(),
-                max_priority_fee_micro_lamports: 100,
-            };
-            let backend = Arc::new(ExecutionBackend::Mainnet(Arc::new(MainnetClient::new(
-                server.url.clone(),
-                &mainnet_config,
-                transport.clone(),
-            ))));
-            let config = Arc::new(
-                AppConfig::load(std::path::Path::new("config.example.toml")).expect("config"),
-            );
-            let worker = ExecutionWorker::new(
-                config.clone(),
-                Arc::new(Keypair::new()),
-                Store::connect("sqlite::memory:").await.expect("store"),
-                backend,
-                TokenSafetyClient::new(&server.url, &transport),
-                TransactionDecoder::new(config.signal.wallet),
-                Arc::new(Router::supported(
-                    Arc::new(transport.solana_rpc(&server.url)),
-                    4,
-                    Duration::from_secs(2),
-                )),
-            );
-            let message = solana_sdk::message::Message::default();
-            let mint = Pubkey::new_unique();
-            let account = Pubkey::new_unique();
-            let started = Instant::now();
-            let result = worker
-                .post_route_reads(&message, AssetId::Token(mint), &account)
-                .await;
-            let parallel = started.elapsed();
-            assert_eq!(result.is_err(), fail_fee);
-            assert_eq!(server.count("sendTransaction"), 0);
-            if !fail_fee {
-                assert_eq!(result.expect("reads"), (5000, 1000000, 123));
-                assert_eq!(
-                    server
-                        .peak_in_flight
-                        .load(std::sync::atomic::Ordering::SeqCst),
-                    3
-                );
-                let started = Instant::now();
-                worker
-                    .backend
-                    .rpc()
-                    .get_fee_for_message(&message)
-                    .await
-                    .expect("fee");
-                worker
-                    .backend
-                    .rpc()
-                    .get_balance(&worker.signer.pubkey())
-                    .await
-                    .expect("SOL");
-                worker
-                    .asset_balance_or_zero(AssetId::Token(mint), &account)
-                    .await
-                    .expect("output");
-                let sequential = started.elapsed();
-                assert!(
-                    parallel < sequential,
-                    "parallel={parallel:?}, sequential={sequential:?}"
-                );
-                eprintln!(
-                    "controlled 75ms RPC fixture: sequential post-route={sequential:?}, concurrent={parallel:?}"
-                );
-            }
         }
     }
 
@@ -1165,9 +978,8 @@ mod timing_tests {
             backend,
             TokenSafetyClient::new(&endpoint, &transport),
             TransactionDecoder::new(config.signal.wallet),
-            Arc::new(Router::supported(
+            Arc::new(Router::new(
                 Arc::new(transport.solana_rpc(&endpoint)),
-                4,
                 Duration::from_secs(2),
             )),
         );
@@ -1378,9 +1190,8 @@ mod unsupported_tests {
             Arc::new(ExecutionBackend::Mainnet(client)),
             TokenSafetyClient::new(&server.url, &transport),
             TransactionDecoder::new(source_wallet),
-            Arc::new(Router::supported(
+            Arc::new(Router::new(
                 Arc::new(transport.solana_rpc(&server.url)),
-                4,
                 Duration::from_secs(2),
             )),
         );

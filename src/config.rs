@@ -27,18 +27,13 @@ pub struct AppConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RoutingConfig {
-    pub race_timeout_ms: u64,
-    pub pool_refresh_seconds: u64,
-    pub max_pools_per_dex: usize,
+    #[serde(alias = "race_timeout_ms")]
+    pub timeout_ms: u64,
 }
 
 impl Default for RoutingConfig {
     fn default() -> Self {
-        Self {
-            race_timeout_ms: 2_000,
-            pool_refresh_seconds: 60,
-            max_pools_per_dex: 4,
-        }
+        Self { timeout_ms: 2_000 }
     }
 }
 
@@ -80,7 +75,11 @@ pub struct SignalConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MainnetConfig {
-    #[serde(default, rename = "skip", alias = "source_direct")]
+    #[serde(
+        default = "default_source_direct",
+        rename = "skip",
+        alias = "source_direct"
+    )]
     pub source_direct: bool,
     #[serde(default)]
     pub fixed_priority_fee_micro_lamports: Option<u64>,
@@ -184,13 +183,9 @@ impl AppConfig {
                 "execution.slippage_bps must not exceed 10000".to_owned(),
             ));
         }
-        if self.routing.race_timeout_ms == 0
-            || self.routing.pool_refresh_seconds == 0
-            || self.routing.max_pools_per_dex == 0
-        {
+        if self.routing.timeout_ms == 0 {
             return Err(CopyTraderError::Configuration(
-                "routing timeouts, refresh interval, and pool limit must be greater than zero"
-                    .to_owned(),
+                "routing.timeout_ms must be greater than zero".to_owned(),
             ));
         }
         if self.http.tcp_keepalive_seconds == 0
@@ -299,9 +294,16 @@ impl ExecutionTarget {
 }
 
 fn validate_sender(config: &MainnetConfig) -> Result<()> {
+    if !config.source_direct {
+        return Err(CopyTraderError::Configuration(
+            "this trader builds only from source instructions; mainnet.skip must be true"
+                .to_owned(),
+        ));
+    }
+
     if config.source_direct && config.fixed_priority_fee_micro_lamports.is_none() {
         return Err(CopyTraderError::Configuration(
-            "mainnet.skip requires fixed_priority_fee_micro_lamports".to_owned(),
+            "source instruction execution requires fixed_priority_fee_micro_lamports".to_owned(),
         ));
     }
     if config
@@ -422,6 +424,10 @@ const fn default_max_priority_fee() -> u64 {
     5_000_000
 }
 
+const fn default_source_direct() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,8 +522,8 @@ mod tests {
             return;
         };
         let mut config = MainnetConfig {
-            source_direct: false,
-            fixed_priority_fee_micro_lamports: None,
+            source_direct: true,
+            fixed_priority_fee_micro_lamports: Some(100),
             sender_url: swqos_url,
             tip_lamports: 4_999,
             priority_level: "high".to_owned(),
@@ -525,8 +531,8 @@ mod tests {
         };
         assert!(validate_sender(&config).is_err());
         config.tip_lamports = 5_000;
-        config.fixed_priority_fee_micro_lamports = None;
-        config.source_direct = false;
+        config.fixed_priority_fee_micro_lamports = Some(100);
+        config.source_direct = true;
         assert!(validate_sender(&config).is_ok());
         config.sender_url = max_url;
         config.tip_lamports = 999_999;
@@ -541,8 +547,8 @@ mod tests {
         assert!(sender_url.is_ok());
         let Ok(sender_url) = sender_url else { return };
         let config = MainnetConfig {
-            source_direct: false,
-            fixed_priority_fee_micro_lamports: None,
+            source_direct: true,
+            fixed_priority_fee_micro_lamports: Some(100),
             sender_url,
             tip_lamports: 5_000,
             priority_level: "unsafeMax".to_owned(),
@@ -556,7 +562,7 @@ mod tests {
         let config: AppConfig =
             toml::from_str(include_str!("../config.example.toml")).expect("config");
         let mut mainnet = config.mainnet.expect("mainnet");
-        assert!(!mainnet.source_direct);
+        assert!(mainnet.source_direct);
         mainnet.source_direct = true;
         mainnet.fixed_priority_fee_micro_lamports = None;
         assert!(validate_sender(&mainnet).is_err());
@@ -574,6 +580,41 @@ mod tests {
         assert_eq!(canonical_priority_level("veryHigh"), Some("VeryHigh"));
         assert_eq!(canonical_priority_level("unsafeMax"), None);
     }
+    #[test]
+    fn source_only_configuration_rejects_quote_mode_and_pool_settings() {
+        let example = include_str!("../config.example.toml");
+        let config: AppConfig = toml::from_str(example).expect("example");
+        assert!(config.mainnet.as_ref().expect("mainnet").source_direct);
+        assert!(AppConfig::load(std::path::Path::new("config.example.toml")).is_ok());
+        let disabled: AppConfig = toml::from_str(&example.replace("skip = true", "skip = false"))
+            .expect("parse old mode");
+        assert!(
+            disabled
+                .validate()
+                .expect_err("quote mode removed")
+                .to_string()
+                .contains("source instructions")
+        );
+        assert!(
+            toml::from_str::<AppConfig>(&example.replace(
+                "timeout_ms = 2000",
+                "timeout_ms = 2000\npool_refresh_seconds = 60"
+            ))
+            .is_err()
+        );
+        assert!(
+            toml::from_str::<AppConfig>(&example.replace(
+                "timeout_ms = 2000",
+                "timeout_ms = 2000\nmax_pools_per_dex = 4"
+            ))
+            .is_err()
+        );
+        let old_timeout: AppConfig =
+            toml::from_str(&example.replace("timeout_ms =", "race_timeout_ms ="))
+                .expect("timeout alias");
+        assert_eq!(old_timeout.routing.timeout_ms, 2000);
+    }
+
     #[test]
     fn removed_backends_and_seeding_configuration_are_rejected() {
         let example = include_str!("../config.example.toml");

@@ -8,9 +8,7 @@ commitment = "processed"
 queue_capacity = 256
 
 [routing]
-race_timeout_ms = 2000
-pool_refresh_seconds = 60
-max_pools_per_dex = 4
+timeout_ms = 2000
 
 [http]
 tcp_keepalive_seconds = 30
@@ -21,7 +19,7 @@ max_idle_connections_per_host = 16
 
 [mainnet]
 # Source-only, source-price minimum output, fixed fee, no simulation or fee RPC.
-skip = false
+skip = true
 fixed_priority_fee_micro_lamports = 100000
 sender_url = "https://sender.helius-rpc.com/fast?swqos_only=true"
 tip_lamports = 5000
