@@ -1,0 +1,9 @@
+/target
+.env
+.env.*
+!.env.example
+/config.toml
+/keypair.json
+/*.sqlite*
+__pycache__/
+*.pyc

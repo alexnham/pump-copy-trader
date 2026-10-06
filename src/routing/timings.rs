@@ -1,0 +1,46 @@
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
+
+/// Summed elapsed time per stage, including failed and cancelled candidates.
+/// Concurrent candidate stages overlap and are not a critical-path duration.
+#[derive(Clone, Default)]
+pub struct RouteStages(Arc<Mutex<BTreeMap<&'static str, u64>>>);
+
+impl RouteStages {
+    pub fn snapshot(&self) -> BTreeMap<&'static str, u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub(super) fn start(&self, name: &'static str) -> StageTimer {
+        StageTimer {
+            stages: self.clone(),
+            name,
+            started: Instant::now(),
+        }
+    }
+}
+
+pub(super) struct StageTimer {
+    stages: RouteStages,
+    name: &'static str,
+    started: Instant,
+}
+
+impl Drop for StageTimer {
+    fn drop(&mut self) {
+        let mut values = self
+            .stages
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let value = values.entry(self.name).or_default();
+        *value = value
+            .saturating_add(u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX));
+    }
+}

@@ -1,0 +1,59 @@
+[signal]
+# Replace with the source wallet. The system program is only a parseable placeholder.
+wallet = "11111111111111111111111111111111"
+# Pick the LaserStream region closest to the machine running this service.
+laserstream_url = "https://laserstream-mainnet-ewr.helius-rpc.com/"
+http_url = "https://mainnet.helius-rpc.com/"
+commitment = "processed"
+queue_capacity = 256
+
+[routing]
+race_timeout_ms = 2000
+pool_refresh_seconds = 60
+max_pools_per_dex = 4
+
+[http]
+tcp_keepalive_seconds = 30
+http2_keepalive_seconds = 20
+http2_keepalive_timeout_seconds = 5
+pool_idle_timeout_seconds = 90
+max_idle_connections_per_host = 16
+
+[mainnet]
+# Source-only, source-price minimum output, fixed fee, no simulation or fee RPC.
+skip = false
+fixed_priority_fee_micro_lamports = 100000
+sender_url = "https://sender.helius-rpc.com/fast?swqos_only=true"
+tip_lamports = 5000
+priority_level = "high"
+max_priority_fee_micro_lamports = 5000000
+
+[storage]
+database_url = "sqlite://copy_trader.sqlite?mode=rwc"
+
+[execution]
+target = "mainnet"
+allow_live_mainnet = false
+slippage_bps = 100
+max_signal_age_seconds = 30
+confirmation_timeout_seconds = 30
+
+[sizing]
+mode = "percent"
+percent_bps = 100
+
+# Safe default: only mints listed below may be traded.
+[token_policy]
+mode = "allowlist"
+
+# To accept any safely inspectable mint, replace the section above with:
+# [token_policy]
+# mode = "all"
+# minimum_input = "0.001"
+# maximum_input = "0.1"
+# Listed token rules remain optional overrides in all-token mode.
+
+[[tokens]]
+mint = "So11111111111111111111111111111111111111112"
+minimum_input = "0.001"
+maximum_input = "0.1"
