@@ -71,11 +71,6 @@ async fn run_service(config: Arc<AppConfig>, store: Store) -> Result<()> {
         .iter()
         .map(|rule| rule.mint)
         .collect::<Vec<_>>();
-    let mut warm_mints = Vec::with_capacity(allowed_mints.len() + 1);
-    warm_mints.push(solana_sdk::pubkey!(
-        "So11111111111111111111111111111111111111112"
-    ));
-    warm_mints.extend(allowed_mints.iter().copied());
     let router = Arc::new(Router::supported(
         discovery_rpc.clone(),
         config.routing.max_pools_per_dex,
@@ -87,32 +82,45 @@ async fn run_service(config: Arc<AppConfig>, store: Store) -> Result<()> {
         signer.pubkey(),
         allowed_mints.clone(),
     ));
-    let warm_configured_pairs = !allowed_mints.is_empty() && !config.allows_all_tokens();
-    let warm_sol_pools = allowed_mints.is_empty() || config.allows_all_tokens();
-    if warm_configured_pairs || warm_sol_pools {
-        let initial_router = router.clone();
-        let initial_mints = warm_mints.clone();
-        tokio::spawn(async move {
-            info!(
-                configured_pairs = warm_configured_pairs,
-                sol_pools = warm_sol_pools,
-                "initial route catalog warming running in background"
-            );
-            if warm_configured_pairs && let Err(error) = initial_router.warm(&initial_mints).await {
-                warn!(%error, "initial configured pair warming failed");
-            }
-            if warm_sol_pools && let Err(error) = initial_router.warm_sol_pools().await {
-                warn!(%error, "initial SOL pool warming failed");
-            }
-            info!("initial route catalog warming complete");
-        });
+    if !config
+        .mainnet
+        .as_ref()
+        .is_some_and(|mainnet| mainnet.source_direct)
+    {
+        let mut warm_mints = Vec::with_capacity(allowed_mints.len() + 1);
+        warm_mints.push(solana_sdk::pubkey!(
+            "So11111111111111111111111111111111111111112"
+        ));
+        warm_mints.extend(allowed_mints.iter().copied());
+        let warm_configured_pairs = !allowed_mints.is_empty() && !config.allows_all_tokens();
+        let warm_sol_pools = allowed_mints.is_empty() || config.allows_all_tokens();
+        if warm_configured_pairs || warm_sol_pools {
+            let initial_router = router.clone();
+            let initial_mints = warm_mints.clone();
+            tokio::spawn(async move {
+                info!(
+                    configured_pairs = warm_configured_pairs,
+                    sol_pools = warm_sol_pools,
+                    "initial route catalog warming running in background"
+                );
+                if warm_configured_pairs
+                    && let Err(error) = initial_router.warm(&initial_mints).await
+                {
+                    warn!(%error, "initial configured pair warming failed");
+                }
+                if warm_sol_pools && let Err(error) = initial_router.warm_sol_pools().await {
+                    warn!(%error, "initial SOL pool warming failed");
+                }
+                info!("initial route catalog warming complete");
+            });
+        }
+        spawn_router_maintenance(
+            router.clone(),
+            warm_mints,
+            !allowed_mints.is_empty() && !config.allows_all_tokens(),
+            config.routing.pool_refresh_seconds,
+        );
     }
-    spawn_router_maintenance(
-        router.clone(),
-        warm_mints,
-        !allowed_mints.is_empty() && !config.allows_all_tokens(),
-        config.routing.pool_refresh_seconds,
-    );
     let worker = ExecutionWorker::new(
         config.clone(),
         signer,

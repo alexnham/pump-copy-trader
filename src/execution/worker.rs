@@ -200,9 +200,16 @@ impl ExecutionWorker {
             return Ok(());
         }
         let mut routing_timings = RoutingTimings::default();
-        let prefetched = self
-            .router
-            .prefetch_source(&intent, &routing_timings.stages);
+        let prefetched = if self
+            .backend
+            .mainnet()
+            .is_some_and(|client| client.source_direct())
+        {
+            None
+        } else {
+            self.router
+                .prefetch_source(&intent, &routing_timings.stages)
+        };
         timings.mark("cache_lookup_complete_ms");
         let direct_mints = if self
             .backend

@@ -72,6 +72,13 @@ source trade's price rather than a fresh quote.
 
 Classic SPL Pump.fun SOL buys can reuse successful source token metadata and avoid
 a mint RPC read. Other routes inspect mints, including Token-2022 extensions.
+Native PumpSwap direct copies check only the copier's WSOL account, rather than
+fetching or scanning pools. An existing WSOL account is reported as unsupported
+to preserve the account-lifecycle safeguard; an RPC failure remains an execution
+error. Native direct copies create a WSOL ATA before the swap and close it afterward
+on both buys and sells. Wallet-derived volume and cashback accounts are rewritten
+for the copier when present in the source instruction.
+
 Sizing, token policy, account rewriting, signing, duplicate reservations,
 confirmation, and balance reconciliation remain enabled.
 
@@ -88,13 +95,15 @@ The hot path requires a fresh cached blockhash. Wallet balances refresh in the
 background every 250 ms after each refresh completes, for SOL and configured token
 accounts. Input balances must be cached before live execution can proceed.
 The output baseline uses the cache when available. Post-confirmation reconciliation
-reads balances from RPC. Pool catalogs warm and refresh in the background.
+reads balances from RPC. Pool catalogs warm and refresh only in quoted mode
+(`mainnet.skip = false`). Source-direct mode starts no pool scans and copies the
+decoded source instruction even when its pool is absent from the catalog.
 Sender connections are pinged on startup and every 30 seconds.
 
 Token admission defaults to an allowlist. All-token admission requires an explicit
 minimum/maximum envelope; configured token entries remain optional per-mint
 limits and prewarming hints. Percentage and fixed input sizing are supported.
-Account state and balance caches can lag the chain; source-price estimates can
+Balance caches can lag the chain; source-price estimates can
 be inaccurate after pool movement. Slippage limits are checked by the on-chain
 instruction.
 

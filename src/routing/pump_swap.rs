@@ -97,10 +97,30 @@ pub(crate) fn copy_source_instruction(
     }
     data[8..16].copy_from_slice(&first.to_le_bytes());
     data[16..24].copy_from_slice(&second.to_le_bytes());
+    let source_volume =
+        pump_rust_client::pda::pump_amm::user_volume_accumulator(&source.source_wallet).0;
+    let copier_volume = pump_rust_client::pda::pump_amm::user_volume_accumulator(&copier).0;
+    let volume_accounts = source
+        .wallet_token_accounts
+        .iter()
+        .map(|(_, mint, program)| {
+            (
+                associated_token_address(&source_volume, mint, program),
+                associated_token_address(&copier_volume, mint, program),
+            )
+        })
+        .collect::<Vec<_>>();
     let mut accounts = source.instruction.accounts.clone();
     for meta in &mut accounts {
         if meta.pubkey == source.source_wallet {
             meta.pubkey = copier;
+        } else if meta.pubkey == source_volume {
+            meta.pubkey = copier_volume;
+        } else if let Some((_, replacement)) = volume_accounts
+            .iter()
+            .find(|(address, _)| *address == meta.pubkey)
+        {
+            meta.pubkey = *replacement;
         } else if let Some((_, mint, token_program)) = source
             .wallet_token_accounts
             .iter()
@@ -124,16 +144,17 @@ pub(crate) fn copy_source_instruction(
             continue;
         }
         prepared_mints.push(*mint);
-        if *mint != Pubkey::from_str_const(NATIVE_MINT) {
-            instructions.push(
-                crate::token::accounts::create_associated_token_account_idempotent(
-                    &copier,
-                    &copier,
-                    mint,
-                    token_program,
-                ),
-            );
-        } else if trade.intent.input_asset == AssetId::NativeSol {
+        instructions.push(
+            crate::token::accounts::create_associated_token_account_idempotent(
+                &copier,
+                &copier,
+                mint,
+                token_program,
+            ),
+        );
+        if *mint == Pubkey::from_str_const(NATIVE_MINT)
+            && trade.intent.input_asset == AssetId::NativeSol
+        {
             instructions.extend(pump_rust_client::token::wrap_sol_instructions(
                 &copier,
                 trade.input_amount,
@@ -146,7 +167,9 @@ pub(crate) fn copy_source_instruction(
         accounts,
         data,
     });
-    if trade.intent.output_asset == AssetId::NativeSol {
+    if trade.intent.input_asset == AssetId::NativeSol
+        || trade.intent.output_asset == AssetId::NativeSol
+    {
         instructions.push(pump_rust_client::token::unwrap_sol_instruction(&copier));
     }
     Ok(PreparedRoute {

@@ -512,44 +512,47 @@ impl Router {
         timeout(self.race_timeout, async {
             let routing = async {
                 let mut last_error = None;
-                if (trade.intent.source_pool.is_none()
-                    || trade
-                        .intent
-                        .source_instruction
-                        .as_ref()
-                        .is_some_and(|source| source.instruction.program_id == pump_fun::PROGRAM_ID))
-                    && trade.intent.source_instruction.is_some()
-                    && trade.intent.source_instruction.as_ref().is_some_and(|source| {
-                        matches!(
-                            source.instruction.program_id,
-                            id if id == DexKind::PumpSwap.program_id() || id == pump_fun::PROGRAM_ID
-                        )
-                    })
-                    && let Some(source_instruction) =
-                        trade.intent.source_instruction.as_ref()
-                    && let Some((expected_output, minimum_output)) = context.route.source_outputs
-                {
-                    let copied = if source_instruction.instruction.program_id == pump_fun::PROGRAM_ID {
-                        pump_fun::copy_source_instruction(
-                            source_instruction, trade, context.route.copier, expected_output, minimum_output,
-                        )
-                    } else {
-                        pump_swap::copy_source_instruction(
-                            source_instruction, trade, context.route.copier, expected_output, minimum_output,
-                        )
-                    };
-                    match copied {
-                        Ok(route) => {
-                            let shared = context
-                                .shared
-                                .clone()
-                                .await
-                                .map_err(CopyTraderError::Execution)?;
-                            info!(dex = route.dex.as_str(), "source instruction copied without pool discovery");
-                            return finish_route(route, shared, context).await;
+                if direct {
+                    let source = trade.intent.source_instruction.as_ref().ok_or_else(|| {
+                        CopyTraderError::Unsupported("source-direct mode requires a decoded Pump instruction".to_owned())
+                    })?;
+                    let (expected_output, minimum_output) = context.route.source_outputs.ok_or_else(|| {
+                        CopyTraderError::Unsupported("source output estimate is unavailable".to_owned())
+                    })?;
+                    let route = match source.instruction.program_id {
+                        id if id == pump_fun::PROGRAM_ID => pump_fun::copy_source_instruction(
+                            source, trade, context.route.copier, expected_output, minimum_output,
+                        )?,
+                        id if id == DexKind::PumpSwap.program_id() => {
+                            let route = pump_swap::copy_source_instruction(
+                                source, trade, context.route.copier, expected_output, minimum_output,
+                            )?;
+                            if trade.intent.source_pool.is_some_and(|hint|
+                                hint.dex != DexKind::PumpSwap || hint.address != route.pool) {
+                                return Err(CopyTraderError::Unsupported("PumpSwap source pool does not match its instruction".to_owned()));
+                            }
+                            if matches!((trade.intent.input_asset, trade.intent.output_asset),
+                                (AssetId::NativeSol, _) | (_, AssetId::NativeSol)) {
+                                let wsol = associated_token_address(&context.route.copier,
+                                    &Pubkey::from_str_const(NATIVE_MINT), &spl_token::id());
+                                let existing = self.discovery_rpc.get_account_with_commitment(
+                                    &wsol, CommitmentConfig::confirmed(),
+                                ).await.map_err(|error| CopyTraderError::Execution(
+                                    format!("cannot inspect copier WSOL account: {error}")))?;
+                                if existing.value.is_some() {
+                                    return Err(CopyTraderError::OutOfScope(
+                                        crate::domain::UnsupportedReason::UnsupportedToken,
+                                        "native PumpSwap source copies require no persistent copier WSOL account".to_owned(),
+                                    ));
+                                }
+                            }
+                            route
                         }
-                        Err(error) => return Err(error),
-                    }
+                        _ => return Err(CopyTraderError::Unsupported("unsupported source-direct program".to_owned())),
+                    };
+                    let shared = context.shared.clone().await.map_err(CopyTraderError::Execution)?;
+                    info!(dex = route.dex.as_str(), "source instruction copied without pool discovery");
+                    return finish_route(route, shared, context).await;
                 }
                 if let Some(hint) = trade.intent.source_pool {
                     // Leave half the total budget for alternatives if the source pool stalls.
@@ -581,72 +584,6 @@ impl Router {
                             )?;
                             (pool, account)
                         };
-                        let native_source_copy = matches!(
-                            (trade.intent.input_asset, trade.intent.output_asset),
-                            (AssetId::NativeSol, _) | (_, AssetId::NativeSol)
-                        );
-                        let persistent_wsol = if hint.dex == DexKind::PumpSwap
-                            && native_source_copy
-                            && trade.intent.source_instruction.is_some()
-                        {
-                            let wsol = associated_token_address(
-                                &context.route.copier,
-                                &Pubkey::from_str_const(NATIVE_MINT),
-                                &spl_token::id(),
-                            );
-                            match self
-                                .discovery_rpc
-                                .get_account_with_commitment(
-                                    &wsol,
-                                    CommitmentConfig::confirmed(),
-                                )
-                                .await
-                            {
-                                Ok(response) => response.value.is_some(),
-                                Err(error) => {
-                                    debug!(%error, "cannot inspect copier WSOL ATA; using cached route");
-                                    true
-                                }
-                            }
-                        } else {
-                            false
-                        };
-                        if hint.dex == DexKind::PumpSwap
-                            && context.route.source_outputs.is_some()
-                            && !persistent_wsol
-                            && let Some(source_instruction) =
-                                trade.intent.source_instruction.as_ref()
-                        {
-                                match pump_swap::copy_source_instruction(
-                                    source_instruction,
-                                    trade,
-                                    context.route.copier,
-                                    context.route.source_outputs
-                                        .ok_or_else(|| {
-                                            CopyTraderError::Unsupported(
-                                                "source output estimate is unavailable".to_owned(),
-                                            )
-                                        })?
-                                        .0,
-                                    context.route.source_outputs
-                                        .ok_or_else(|| {
-                                            CopyTraderError::Unsupported(
-                                                "source output estimate is unavailable".to_owned(),
-                                            )
-                                        })?
-                                        .1,
-                                ) {
-                                    Ok(route) => {
-                                        let shared = context
-                                            .shared
-                                            .clone()
-                                            .await
-                                            .map_err(CopyTraderError::Execution)?;
-                                        return finish_route(route, shared, context).await;
-                                    }
-                                                Err(error) => return Err(error),
-                            }
-                        }
                         let winner = self
                             .race_pools(context, vec![pool.clone()], Some(&account))
                             .await?;
