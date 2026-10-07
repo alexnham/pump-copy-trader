@@ -15,10 +15,7 @@ use solana_sdk::{
 };
 
 use crate::{
-    domain::{
-        LoadedAddresses, ObservedTransaction, SignalOrigin, TransactionMeta, UiCompiledInstruction,
-        UiInnerInstructions, UiTokenAmount, UiTokenBalance,
-    },
+    domain::{ObservedTransaction, SignalOrigin, TransactionMeta, UiTokenAmount, UiTokenBalance},
     error::{CopyTraderError, Result},
 };
 
@@ -158,57 +155,48 @@ fn decode_meta(meta: grpc_solana::TransactionStatusMeta) -> Result<TransactionMe
     let err = meta
         .err
         .map(|error| json!({ "laserstream": bs58::encode(error.err).into_string() }));
-    let inner_instructions = (!meta.inner_instructions_none)
-        .then(|| {
+    let live_inner_instructions = if meta.inner_instructions_none {
+        None
+    } else {
+        let mut instructions = Vec::with_capacity(
             meta.inner_instructions
-                .into_iter()
-                .map(|group| {
-                    Ok(UiInnerInstructions {
-                        index: checked_u8(group.index, "inner instruction group index")?,
-                        instructions: group
-                            .instructions
-                            .into_iter()
-                            .map(|instruction| {
-                                Ok(UiCompiledInstruction {
-                                    program_id_index: checked_u8(
-                                        instruction.program_id_index,
-                                        "inner instruction program id index",
-                                    )?,
-                                    accounts: instruction.accounts,
-                                    data: bs58::encode(instruction.data).into_string(),
-                                    stack_height: instruction.stack_height,
-                                })
-                            })
-                            .collect::<Result<Vec<_>>>()?,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .transpose()?;
+                .iter()
+                .map(|group| group.instructions.len())
+                .sum(),
+        );
+        for group in meta.inner_instructions {
+            checked_u8(group.index, "inner instruction group index")?;
+            for instruction in group.instructions {
+                instructions.push(CompiledInstruction {
+                    program_id_index: checked_u8(
+                        instruction.program_id_index,
+                        "inner instruction program id index",
+                    )?,
+                    accounts: instruction.accounts,
+                    data: instruction.data,
+                });
+            }
+        }
+        Some(instructions)
+    };
     let log_messages = (!meta.log_messages_none).then_some(meta.log_messages);
     let pre_token_balances = decode_token_balances(meta.pre_token_balances)?;
     let post_token_balances = decode_token_balances(meta.post_token_balances)?;
-    let writable = meta
+    let live_loaded_addresses = meta
         .loaded_writable_addresses
         .into_iter()
-        .map(|address| {
-            decode_pubkey(&address, "loaded writable address").map(|key| key.to_string())
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let readonly = meta
-        .loaded_readonly_addresses
-        .into_iter()
-        .map(|address| {
-            decode_pubkey(&address, "loaded readonly address").map(|key| key.to_string())
-        })
+        .chain(meta.loaded_readonly_addresses)
+        .map(|address| decode_pubkey(&address, "loaded address"))
         .collect::<Result<Vec<_>>>()?;
     Ok(TransactionMeta {
         err,
-        inner_instructions,
+        inner_instructions: None,
+        live_inner_instructions,
+        live_loaded_addresses: Some(live_loaded_addresses),
         log_messages,
         pre_token_balances: Some(pre_token_balances),
         post_token_balances: Some(post_token_balances),
-        loaded_addresses: Some(LoadedAddresses { writable, readonly }),
+        loaded_addresses: None,
         compute_units_consumed: meta.compute_units_consumed,
         pre_balances: meta.pre_balances,
         post_balances: meta.post_balances,
@@ -327,5 +315,104 @@ mod tests {
         assert_eq!(observed.as_ref().map(|value| value.slot), Some(123));
         assert_eq!(observed.as_ref().map(|value| value.block_time), Some(None));
         assert_eq!(observed.map(|value| value.signature), Some(signature));
+    }
+    #[test]
+    fn live_metadata_preserves_binary_instructions_and_address_order() {
+        let writable = Pubkey::new_unique();
+        let readonly = Pubkey::new_unique();
+        let meta = grpc_solana::TransactionStatusMeta {
+            loaded_writable_addresses: vec![writable.to_bytes().to_vec()],
+            loaded_readonly_addresses: vec![readonly.to_bytes().to_vec()],
+            inner_instructions: vec![grpc_solana::InnerInstructions {
+                index: 3,
+                instructions: vec![grpc_solana::InnerInstruction {
+                    program_id_index: 2,
+                    accounts: vec![0, 1],
+                    data: vec![7; 700],
+                    stack_height: Some(2),
+                }],
+            }],
+            ..Default::default()
+        };
+        let decoded = decode_meta(meta).expect("binary metadata");
+        assert_eq!(
+            decoded.live_loaded_addresses,
+            Some(vec![writable, readonly])
+        );
+        let instructions = decoded.live_inner_instructions.expect("inner instructions");
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(instructions[0].data, vec![7; 700]);
+        assert_eq!(instructions[0].accounts, vec![0, 1]);
+        assert!(decoded.inner_instructions.is_none());
+        assert!(decoded.loaded_addresses.is_none());
+        for bytes in [vec![], vec![0; 31], vec![0; 33]] {
+            assert!(
+                decode_meta(grpc_solana::TransactionStatusMeta {
+                    loaded_writable_addresses: vec![bytes],
+                    ..Default::default()
+                })
+                .is_err()
+            );
+        }
+        assert!(
+            decode_meta(grpc_solana::TransactionStatusMeta {
+                inner_instructions: vec![grpc_solana::InnerInstructions {
+                    index: 256,
+                    instructions: vec![],
+                }],
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual decode conversion benchmark"]
+    fn benchmark_live_metadata_conversion() {
+        use std::{hint::black_box, time::Instant};
+        let meta = grpc_solana::TransactionStatusMeta {
+            loaded_writable_addresses: (0..20)
+                .map(|_| Pubkey::new_unique().to_bytes().to_vec())
+                .collect(),
+            inner_instructions: vec![grpc_solana::InnerInstructions {
+                index: 0,
+                instructions: (0..12)
+                    .map(|i| grpc_solana::InnerInstruction {
+                        program_id_index: 1,
+                        accounts: vec![0, 1, 2],
+                        data: vec![i; if i == 0 { 700 } else { 32 }],
+                        stack_height: Some(2),
+                    })
+                    .collect(),
+            }],
+            ..Default::default()
+        };
+        let rounds = 1000;
+        let start = Instant::now();
+        for _ in 0..rounds {
+            let input = black_box(meta.clone());
+            for group in &input.inner_instructions {
+                for ix in &group.instructions {
+                    let encoded = bs58::encode(&ix.data).into_string();
+                    black_box(bs58::decode(encoded).into_vec().expect("legacy data"));
+                }
+            }
+            for bytes in &input.loaded_writable_addresses {
+                let key = Pubkey::try_from(bytes.as_slice()).expect("key");
+                black_box(key.to_string().parse::<Pubkey>().expect("legacy address"));
+            }
+            black_box(decode_meta(input).expect("metadata"));
+        }
+        let legacy = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..rounds {
+            black_box(decode_meta(black_box(meta.clone())).expect("metadata"));
+        }
+        let binary = start.elapsed();
+        eprintln!(
+            "metadata fixture: legacy conversions + decode {:.2} us/op; binary decode {:.2} us/op",
+            legacy.as_secs_f64() * 1e6 / f64::from(rounds),
+            binary.as_secs_f64() * 1e6 / f64::from(rounds)
+        );
     }
 }

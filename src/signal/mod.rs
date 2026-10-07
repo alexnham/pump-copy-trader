@@ -19,5 +19,8 @@ pub trait SignalSource: Send + Sync {
 pub struct QueuedObservation {
     pub observed: ObservedTransaction,
     pub received_at: std::time::Instant,
+    pub queued_at: std::time::Instant,
+    pub payload_decode_us: u64,
+    pub observation_enqueue_us: u64,
     pub database_timings: crate::storage::DatabaseTimings,
 }

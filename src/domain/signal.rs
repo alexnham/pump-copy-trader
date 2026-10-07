@@ -33,6 +33,11 @@ pub struct ObservedTransaction {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransactionMeta {
+    #[serde(skip)]
+    pub live_inner_instructions:
+        Option<Vec<solana_sdk::message::compiled_instruction::CompiledInstruction>>,
+    #[serde(skip)]
+    pub live_loaded_addresses: Option<Vec<solana_sdk::pubkey::Pubkey>>,
     pub err: Option<Value>,
     #[serde(default)]
     pub inner_instructions: Option<Vec<UiInnerInstructions>>,

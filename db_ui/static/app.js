@@ -61,17 +61,17 @@ async function loadFlowStats(){
     if(version!==state.version||state.view!=='flow')return;
     const table=node('table');
     const header=node('tr');
-    for(const label of ['Path','Trades','Receipt → send','Preparation','Mint RPC','Route','Build','Sender','Landing gap'])header.append(node('th',label));
+    for(const label of ['Path','Trades','Receipt → send','Decode','Preparation','Mint RPC','Route','Build','Sign','Sender','Landing gap'])header.append(node('th',label));
     table.append(node('thead'));table.tHead.append(header);
     const body=node('tbody');
     const paths=[['pump_fun_source','Pump.fun · source metadata'],['pump_fun_rpc','Pump.fun · mint RPC'],['pump_swap_source','PumpSwap · source instruction']];
-    const fields=['receipt_to_send_start_ms','preparation_ms','mint_read_ms','route_wall_ms','route_instruction_build_ms','sender_request_ms','slot_delta'];
+    const fields=['receipt_to_send_start_ms','decode_us','preparation_ms','mint_read_ms','route_wall_ms','transaction_build_us','transaction_sign_us','sender_request_ms','slot_delta'];
     for(const [key,label] of paths){
       const group=result.groups[key]||{count:0,metrics:{}};
       const row=node('tr');row.append(node('td',label),node('td',number(group.count)));
       for(const field of fields){
         const sample=group.metrics[field];
-        const cell=node('td',sample?(field==='slot_delta'?`${sample.average} slots`:formatMs(sample.average)):'—');
+        const cell=node('td',sample?(field==='slot_delta'?`${sample.average} slots`:field.endsWith('_us')?`${number(sample.average)} µs`:formatMs(sample.average)):'—');
         if(sample&&sample.count!==group.count)cell.title=`${sample.count} trades have this timing`;
         row.append(cell);
       }

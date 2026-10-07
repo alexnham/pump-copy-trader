@@ -40,7 +40,18 @@ impl Drop for StageTimer {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let value = values.entry(self.name).or_default();
-        *value = value
-            .saturating_add(u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        let elapsed = self.started.elapsed();
+        *value = value.saturating_add(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+        if let Some(name) = self.name.strip_suffix("_ms") {
+            let name = match name {
+                "route_instruction_build" => "route_instruction_build_us",
+                "route_shared_preparation" => "route_shared_preparation_us",
+                "transaction_build" => "transaction_build_us",
+                "transaction_sign" => "transaction_sign_us",
+                _ => return,
+            };
+            let value = values.entry(name).or_default();
+            *value = value.saturating_add(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
+        }
     }
 }

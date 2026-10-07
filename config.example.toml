@@ -37,6 +37,7 @@ max_signal_age_seconds = 30
 confirmation_timeout_seconds = 30
 
 [sizing]
+# Buy sizing; token-to-SOL exits mirror the source sold fraction of our holdings.
 mode = "percent"
 percent_bps = 100
 

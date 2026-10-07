@@ -315,11 +315,23 @@ fn validate_sender(config: &MainnetConfig) -> Result<()> {
         ));
     }
 
-    if config.sender_url.scheme() != "https"
-        || config.sender_url.host_str() != Some("sender.helius-rpc.com")
-    {
+    let regional = matches!(
+        config.sender_url.host_str(),
+        Some(
+            "slc-sender.helius-rpc.com"
+                | "ewr-sender.helius-rpc.com"
+                | "lon-sender.helius-rpc.com"
+                | "fra-sender.helius-rpc.com"
+                | "ams-sender.helius-rpc.com"
+                | "sg-sender.helius-rpc.com"
+                | "tyo-sender.helius-rpc.com"
+        )
+    );
+    let global = config.sender_url.host_str() == Some("sender.helius-rpc.com")
+        && config.sender_url.scheme() == "https";
+    if !(global || regional && matches!(config.sender_url.scheme(), "http" | "https")) {
         return Err(CopyTraderError::Configuration(
-            "mainnet.sender_url must use https://sender.helius-rpc.com".to_owned(),
+            "mainnet.sender_url must use the global HTTPS or a supported regional Helius Sender endpoint".to_owned(),
         ));
     }
     let swqos_only = config
@@ -539,6 +551,41 @@ mod tests {
         assert!(validate_sender(&config).is_err());
         config.tip_lamports = 1_000_000;
         assert!(validate_sender(&config).is_ok());
+    }
+
+    #[test]
+    fn sender_accepts_documented_regions_and_rejects_other_hosts() {
+        let mut config = MainnetConfig {
+            source_direct: true,
+            fixed_priority_fee_micro_lamports: Some(100),
+            sender_url: Url::parse("https://sender.helius-rpc.com/fast").expect("url"),
+            tip_lamports: 1_000_000,
+            priority_level: "high".into(),
+            max_priority_fee_micro_lamports: 1_000_000,
+        };
+        for region in ["slc", "ewr", "lon", "fra", "ams", "sg", "tyo"] {
+            config.sender_url = Url::parse(&format!(
+                "http://{region}-sender.helius-rpc.com/fast?api-key=fixture"
+            ))
+            .expect("regional url");
+            assert!(validate_sender(&config).is_ok(), "{region}");
+            config
+                .sender_url
+                .query_pairs_mut()
+                .append_pair("swqos_only", "true");
+            config.tip_lamports = 5_000;
+            assert!(validate_sender(&config).is_ok());
+            config.tip_lamports = 1_000_000;
+        }
+        for endpoint in [
+            "http://sender.helius-rpc.com/fast",
+            "http://unknown-sender.helius-rpc.com/fast",
+            "http://ewr-sender.helius-rpc.com.example.com/fast",
+            "ftp://ewr-sender.helius-rpc.com/fast",
+        ] {
+            config.sender_url = Url::parse(endpoint).expect("url");
+            assert!(validate_sender(&config).is_err(), "{endpoint}");
+        }
     }
 
     #[test]

@@ -23,9 +23,274 @@ use crate::{
 pub struct Store {
     pool: SqlitePool,
     timings: Option<super::DatabaseTimings>,
+    journal: Option<std::sync::Arc<super::journal::Journal>>,
 }
 
 impl Store {
+    fn persistence_store(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            timings: None,
+            journal: None,
+        }
+    }
+
+    pub(crate) async fn background_journal(&self) -> Result<(Self, super::journal::JournalWriter)> {
+        let attempts: Vec<String> =
+            sqlx::query_scalar("SELECT source_signature FROM copy_attempts")
+                .fetch_all(&self.pool)
+                .await?;
+        let unsupported: Vec<String> = sqlx::query_scalar(
+            "SELECT signature FROM source_transactions WHERE status = 'unsupported'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let submitted: Vec<String> = sqlx::query_scalar("SELECT source_signature FROM copy_attempts WHERE local_signature IS NOT NULL OR status NOT IN ('prepared', 'unsupported')").fetch_all(&self.pool).await?;
+        let (journal, writer) = super::journal::Journal::start(attempts, unsupported, submitted);
+        let mut store = self.clone();
+        store.journal = Some(journal);
+        Ok((store, writer))
+    }
+
+    pub async fn record_observation(&self, observed: &ObservedTransaction) -> Result<bool> {
+        if let Some(journal) = &self.journal {
+            if journal.is_unsupported(&observed.signature.to_string())? {
+                return Ok(false);
+            }
+            let store = self.persistence_store();
+            let observed = observed.clone();
+            journal.enqueue(Box::pin(async move {
+                store
+                    .record_observation_persist(&observed)
+                    .await
+                    .map(|_| ())
+            }))?;
+            return Ok(true);
+        }
+        self.record_observation_persist(observed).await
+    }
+    pub async fn mark_intent(&self, signature: &str, intent: &TradeIntent) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            let store = self.persistence_store();
+            let signature = signature.to_owned();
+            let intent = intent.clone();
+            journal.enqueue(Box::pin(async move {
+                store
+                    .mark_intent_persist(&signature, &intent)
+                    .await
+                    .map(|_| ())
+            }))?;
+            return Ok(());
+        }
+        self.mark_intent_persist(signature, intent).await
+    }
+    pub async fn mark_decoded(&self, signature: &str, dex: &str, pool: &str) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            let store = self.persistence_store();
+            let signature = signature.to_owned();
+            let dex = dex.to_owned();
+            let pool = pool.to_owned();
+            journal.enqueue(Box::pin(async move {
+                store
+                    .mark_decoded_persist(&signature, &dex, &pool)
+                    .await
+                    .map(|_| ())
+            }))?;
+            return Ok(());
+        }
+        self.mark_decoded_persist(signature, dex, pool).await
+    }
+    pub async fn mark_skipped(&self, signature: &str, reason: SkipReason) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            let store = self.persistence_store();
+            let signature = signature.to_owned();
+            journal.enqueue(Box::pin(async move {
+                store
+                    .mark_skipped_persist(&signature, reason)
+                    .await
+                    .map(|_| ())
+            }))?;
+            return Ok(());
+        }
+        self.mark_skipped_persist(signature, reason).await
+    }
+    pub async fn mark_unsupported(
+        &self,
+        signature: &str,
+        reason: UnsupportedReason,
+        message: &str,
+    ) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            journal.unsupported(signature)?;
+            let store = self.persistence_store();
+            let signature = signature.to_owned();
+            let message = message.to_owned();
+            journal.enqueue(Box::pin(async move {
+                store
+                    .mark_unsupported_persist(&signature, reason, &message)
+                    .await
+                    .map(|_| ())
+            }))?;
+            return Ok(());
+        }
+        self.mark_unsupported_persist(signature, reason, message)
+            .await
+    }
+    pub async fn reserve_attempt(
+        &self,
+        source_signature: &str,
+        target: ExecutionTarget,
+        input_amount: u64,
+        minimum_output: u64,
+    ) -> Result<bool> {
+        if let Some(journal) = &self.journal {
+            if !journal.claim(source_signature)? {
+                return Ok(false);
+            }
+            let store = self.persistence_store();
+            let source_signature = source_signature.to_owned();
+            journal.enqueue(Box::pin(async move {
+                store
+                    .reserve_attempt_persist(
+                        &source_signature,
+                        target,
+                        input_amount,
+                        minimum_output,
+                    )
+                    .await
+                    .map(|_| ())
+            }))?;
+            return Ok(true);
+        }
+        self.reserve_attempt_persist(source_signature, target, input_amount, minimum_output)
+            .await
+    }
+    pub async fn persist_signed(
+        &self,
+        source_signature: &str,
+        local_signature: &str,
+        signed_transaction: &[u8],
+        simulation_json: &str,
+    ) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            journal.submitted(source_signature)?;
+            let store = self.persistence_store();
+            let source_signature = source_signature.to_owned();
+            let local_signature = local_signature.to_owned();
+            let signed_transaction = signed_transaction.to_vec();
+            let simulation_json = simulation_json.to_owned();
+            journal.enqueue(Box::pin(async move {
+                store
+                    .persist_signed_persist(
+                        &source_signature,
+                        &local_signature,
+                        &signed_transaction,
+                        &simulation_json,
+                    )
+                    .await
+                    .map(|_| ())
+            }))?;
+            return Ok(());
+        }
+        self.persist_signed_persist(
+            source_signature,
+            local_signature,
+            signed_transaction,
+            simulation_json,
+        )
+        .await
+    }
+    pub async fn record_landed_slot(&self, source_signature: &str, slot: u64) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            let store = self.persistence_store();
+            let source_signature = source_signature.to_owned();
+            journal.enqueue(Box::pin(async move {
+                store
+                    .record_landed_slot_persist(&source_signature, slot)
+                    .await
+                    .map(|_| ())
+            }))?;
+            return Ok(());
+        }
+        self.record_landed_slot_persist(source_signature, slot)
+            .await
+    }
+    pub async fn update_attempt(
+        &self,
+        source_signature: &str,
+        status: AttemptStatus,
+        error: Option<&str>,
+    ) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            let store = self.persistence_store();
+            let source_signature = source_signature.to_owned();
+            let error = error.map(str::to_owned);
+            journal.enqueue(Box::pin(async move {
+                store
+                    .update_attempt_persist(&source_signature, status, error.as_deref())
+                    .await
+                    .map(|_| ())
+            }))?;
+            return Ok(());
+        }
+        self.update_attempt_persist(source_signature, status, error)
+            .await
+    }
+    pub async fn update_cursor(&self, wallet: &str, signature: &str, slot: u64) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            let store = self.persistence_store();
+            let wallet = wallet.to_owned();
+            let signature = signature.to_owned();
+            journal.enqueue(Box::pin(async move {
+                store
+                    .update_cursor_persist(&wallet, &signature, slot)
+                    .await
+                    .map(|_| ())
+            }))?;
+            return Ok(());
+        }
+        self.update_cursor_persist(wallet, signature, slot).await
+    }
+    pub async fn mark_route(
+        &self,
+        signature: &str,
+        dex: &str,
+        pool: &str,
+        minimum_output: u64,
+        quoted_output: u64,
+        route_latency_ms: u64,
+    ) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            let store = self.persistence_store();
+            let signature = signature.to_owned();
+            let dex = dex.to_owned();
+            let pool = pool.to_owned();
+            journal.enqueue(Box::pin(async move {
+                store
+                    .mark_route_persist(
+                        &signature,
+                        &dex,
+                        &pool,
+                        minimum_output,
+                        quoted_output,
+                        route_latency_ms,
+                    )
+                    .await
+                    .map(|_| ())
+            }))?;
+            return Ok(());
+        }
+        self.mark_route_persist(
+            signature,
+            dex,
+            pool,
+            minimum_output,
+            quoted_output,
+            route_latency_ms,
+        )
+        .await
+    }
+
     pub async fn connect(database_url: &str) -> Result<Self> {
         let options = SqliteConnectOptions::from_str(database_url)?
             .journal_mode(SqliteJournalMode::Wal)
@@ -44,6 +309,7 @@ impl Store {
         Ok(Self {
             pool,
             timings: None,
+            journal: None,
         })
     }
 
@@ -51,10 +317,14 @@ impl Store {
         Self {
             pool: self.pool.clone(),
             timings: Some(timings),
+            journal: self.journal.clone(),
         }
     }
 
-    pub async fn record_observation(&self, observed: &ObservedTransaction) -> Result<bool> {
+    pub(super) async fn record_observation_persist(
+        &self,
+        observed: &ObservedTransaction,
+    ) -> Result<bool> {
         let _timer = self
             .timings
             .as_ref()
@@ -121,7 +391,12 @@ impl Store {
         Ok(())
     }
 
-    pub async fn mark_decoded(&self, signature: &str, dex: &str, pool: &str) -> Result<()> {
+    pub(super) async fn mark_decoded_persist(
+        &self,
+        signature: &str,
+        dex: &str,
+        pool: &str,
+    ) -> Result<()> {
         sqlx::query(
             "UPDATE source_transactions SET status = 'decoded', dex = ?, pool = ?, updated_at = ? WHERE signature = ?",
         )
@@ -134,7 +409,11 @@ impl Store {
         Ok(())
     }
 
-    pub async fn mark_intent(&self, signature: &str, intent: &TradeIntent) -> Result<()> {
+    pub(super) async fn mark_intent_persist(
+        &self,
+        signature: &str,
+        intent: &TradeIntent,
+    ) -> Result<()> {
         let _timer = self
             .timings
             .as_ref()
@@ -158,7 +437,7 @@ impl Store {
         Ok(())
     }
 
-    pub async fn mark_route(
+    pub(super) async fn mark_route_persist(
         &self,
         signature: &str,
         dex: &str,
@@ -199,7 +478,11 @@ impl Store {
         Ok(())
     }
 
-    pub async fn mark_skipped(&self, signature: &str, reason: SkipReason) -> Result<()> {
+    pub(super) async fn mark_skipped_persist(
+        &self,
+        signature: &str,
+        reason: SkipReason,
+    ) -> Result<()> {
         let timer = self
             .timings
             .as_ref()
@@ -220,12 +503,15 @@ impl Store {
     }
 
     pub async fn is_unsupported(&self, signature: &str) -> Result<bool> {
+        if let Some(journal) = &self.journal {
+            return journal.is_unsupported(signature);
+        }
         Ok(sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM source_transactions WHERE signature = ? AND status = 'unsupported'"
         ).bind(signature).fetch_one(&self.pool).await? > 0)
     }
 
-    pub async fn mark_unsupported(
+    pub(super) async fn mark_unsupported_persist(
         &self,
         signature: &str,
         reason: UnsupportedReason,
@@ -260,7 +546,7 @@ impl Store {
         Ok(())
     }
 
-    pub async fn reserve_attempt(
+    pub(super) async fn reserve_attempt_persist(
         &self,
         source_signature: &str,
         target: ExecutionTarget,
@@ -292,7 +578,7 @@ impl Store {
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn persist_signed(
+    pub(super) async fn persist_signed_persist(
         &self,
         source_signature: &str,
         local_signature: &str,
@@ -321,7 +607,11 @@ impl Store {
         Ok(())
     }
 
-    pub async fn record_landed_slot(&self, source_signature: &str, slot: u64) -> Result<()> {
+    pub(super) async fn record_landed_slot_persist(
+        &self,
+        source_signature: &str,
+        slot: u64,
+    ) -> Result<()> {
         let _timer = self
             .timings
             .as_ref()
@@ -340,7 +630,7 @@ impl Store {
         Ok(())
     }
 
-    pub async fn update_attempt(
+    pub(super) async fn update_attempt_persist(
         &self,
         source_signature: &str,
         status: AttemptStatus,
@@ -362,7 +652,12 @@ impl Store {
         Ok(())
     }
 
-    pub async fn update_cursor(&self, wallet: &str, signature: &str, slot: u64) -> Result<()> {
+    pub(super) async fn update_cursor_persist(
+        &self,
+        wallet: &str,
+        signature: &str,
+        slot: u64,
+    ) -> Result<()> {
         let slot = i64::try_from(slot)
             .map_err(|_| CopyTraderError::Storage("slot exceeds SQLite INTEGER".to_owned()))?;
         sqlx::query(
@@ -415,6 +710,17 @@ impl Store {
     }
 
     pub(crate) async fn record_timing_batch(&self, records: &[(String, String)]) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            let store = self.persistence_store();
+            let records = records.to_vec();
+            return journal.enqueue(Box::pin(async move {
+                for (signature, json) in records {
+                    store.record_timings(&signature, &json).await?;
+                }
+                Ok(())
+            }));
+        }
+
         let mut transaction = self.pool.begin().await?;
         for (signature, timings) in records {
             sqlx::query("UPDATE source_transactions SET timings_json = ? WHERE signature = ?")
@@ -644,5 +950,91 @@ mod timing_tests {
             stored,
             ("pump_swap".to_owned(), "90".to_owned(), "100".to_owned())
         );
+    }
+}
+
+#[cfg(test)]
+mod background_tests {
+    use super::*;
+    use crate::domain::TransactionMeta;
+    use solana_sdk::{signature::Signature, transaction::VersionedTransaction};
+
+    #[tokio::test]
+    async fn blocked_database_does_not_block_claims_or_journal_enqueue() {
+        let base = Store::connect("sqlite::memory:").await.expect("store");
+        let (store, mut writer) = base.background_journal().await.expect("writer");
+        let mut connections = Vec::new();
+        for _ in 0..5 {
+            connections.push(base.pool.acquire().await.expect("connection"));
+        }
+        let observed = ObservedTransaction {
+            signature: Signature::default(),
+            slot: 42,
+            block_time: None,
+            origin: SignalOrigin::Live,
+            transaction: VersionedTransaction::default(),
+            meta: TransactionMeta::default(),
+            raw_payload: "{}".into(),
+            received_bytes: 2,
+        };
+        let signature = observed.signature.to_string();
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            assert!(
+                store
+                    .record_observation(&observed)
+                    .await
+                    .expect("observation")
+            );
+            assert!(
+                store
+                    .reserve_attempt(&signature, ExecutionTarget::Mainnet, 100, 90)
+                    .await
+                    .expect("claim")
+            );
+            assert!(
+                !store
+                    .reserve_attempt(&signature, ExecutionTarget::Mainnet, 100, 90)
+                    .await
+                    .expect("duplicate")
+            );
+            store
+                .persist_signed(&signature, "local", &[1, 2], "{}")
+                .await
+                .expect("signed");
+            store
+                .record_landed_slot(&signature, 43)
+                .await
+                .expect("slot");
+            store
+                .update_attempt(&signature, AttemptStatus::Landed, None)
+                .await
+                .expect("landed");
+            store
+                .update_cursor("wallet", &signature, 42)
+                .await
+                .expect("cursor");
+            store
+                .record_timing_batch(&[(signature.clone(), "{}".into())])
+                .await
+                .expect("timings");
+        })
+        .await
+        .expect("enqueue must not wait for pool");
+        drop(connections);
+        drop(store);
+        writer.wait().await.expect("drain");
+        let rows = base.status(10).await.expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].copy_status.as_deref(), Some("landed"));
+        assert_eq!(rows[0].timings_json.as_deref(), Some("{}"));
+        let (restarted, mut writer) = base.background_journal().await.expect("restart");
+        assert!(
+            !restarted
+                .reserve_attempt(&signature, ExecutionTarget::Mainnet, 100, 90)
+                .await
+                .expect("persisted duplicate")
+        );
+        drop(restarted);
+        writer.wait().await.expect("drain");
     }
 }

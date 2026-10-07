@@ -133,7 +133,7 @@ class Database:
                     "copy": dict(zip(copy["columns"], copy["rows"][0])) if copy["rows"] else None}
 
     def flow_stats(self):
-        metrics = ("ingestion_queue_ms", "preparation_ms", "mint_read_ms", "route_wall_ms",
+        metrics = ("decode_us", "transaction_build_us", "transaction_sign_us", "ingestion_queue_ms", "preparation_ms", "mint_read_ms", "route_wall_ms",
                    "route_instruction_build_ms", "receipt_to_send_start_ms", "sender_request_ms",
                    "confirmation_ms", "slot_delta")
         groups = {name: {"count": 0, "metrics": {}} for name in

@@ -2,24 +2,29 @@ use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
 };
-use std::str::FromStr;
-use tracing::{debug, info};
+
+use tracing::debug;
 
 use crate::domain::{
     AssetId, DexKind, ObservedTransaction, SourceInstruction, SourcePool, UnsupportedReason,
 };
 use crate::error::{CopyTraderError, Result};
 
-use super::transaction::{all_instructions, full_account_keys};
+use super::transaction::DecodeContext;
 use crate::routing::pump_fun;
 
 const PUMP_SWAP_BUY: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 const ANCHOR_EVENT: [u8; 8] = 0x1d9acb512ea545e4_u64.to_le_bytes();
 
+#[cfg(test)]
 pub(super) fn extract_source_pool(observed: &ObservedTransaction) -> Option<SourcePool> {
-    let keys = full_account_keys(observed).ok()?;
+    extract_source_pool_with_context(&DecodeContext::new(observed).ok()?)
+}
+
+pub(super) fn extract_source_pool_with_context(context: &DecodeContext) -> Option<SourcePool> {
+    let keys = &context.keys;
     let mut hint = None;
-    for instruction in all_instructions(observed).ok()? {
+    for instruction in &context.instructions {
         let program = keys.get(usize::from(instruction.program_id_index))?;
         let Some(dex) = [DexKind::PumpSwap]
             .into_iter()
@@ -50,21 +55,38 @@ pub(super) fn extract_source_pool(observed: &ObservedTransaction) -> Option<Sour
     hint
 }
 
+#[cfg(test)]
 pub(super) fn extract_source_instruction(
     observed: &ObservedTransaction,
     source_wallet: Pubkey,
     input_asset: AssetId,
     output_asset: AssetId,
 ) -> Option<SourceInstruction> {
-    let keys = full_account_keys(observed).ok()?;
+    extract_source_instruction_with_context(
+        observed,
+        &DecodeContext::new(observed).ok()?,
+        source_wallet,
+        input_asset,
+        output_asset,
+    )
+}
+
+pub(super) fn extract_source_instruction_with_context(
+    observed: &ObservedTransaction,
+    context: &DecodeContext,
+    source_wallet: Pubkey,
+    input_asset: AssetId,
+    output_asset: AssetId,
+) -> Option<SourceInstruction> {
+    let keys = &context.keys;
     let message = &observed.transaction.message;
     let mut found = None;
     let mut inspected = Vec::new();
-    for instruction in all_instructions(observed).ok()? {
+    for instruction in &context.instructions {
         let Some(program) = keys.get(usize::from(instruction.program_id_index)).copied() else {
             continue;
         };
-        if inspected.len() < 32 {
+        if tracing::enabled!(tracing::Level::DEBUG) && inspected.len() < 32 {
             let Some(discriminator): Option<[u8; 8]> = instruction
                 .data
                 .get(..8)
@@ -102,7 +124,7 @@ pub(super) fn extract_source_instruction(
         } else {
             DexKind::PumpSwap
         };
-        info!(
+        debug!(
             dex = dex.as_str(),
             discriminator = ?discriminator,
             accounts = instruction.accounts.len(),
@@ -131,7 +153,7 @@ pub(super) fn extract_source_instruction(
             );
             continue;
         }
-        info!(
+        debug!(
             dex = dex.as_str(),
             discriminator = ?discriminator,
             account_count = instruction.accounts.len(),
@@ -142,7 +164,7 @@ pub(super) fn extract_source_instruction(
         for account_index in &instruction.accounts {
             let index = usize::from(*account_index);
             let Some(pubkey) = keys.get(index).copied() else {
-                info!(
+                debug!(
                     dex = dex.as_str(),
                     discriminator = ?discriminator,
                     account_index = index,
@@ -159,7 +181,7 @@ pub(super) fn extract_source_instruction(
             });
         }
         if metas.len() != instruction.accounts.len() {
-            info!(
+            debug!(
                 dex = dex.as_str(),
                 discriminator = ?discriminator,
                 resolved_accounts = metas.len(),
@@ -169,7 +191,7 @@ pub(super) fn extract_source_instruction(
             continue;
         }
         let source_wallet_present = metas.iter().any(|meta| meta.pubkey == source_wallet);
-        info!(
+        debug!(
             dex = dex.as_str(),
             discriminator = ?discriminator,
             source_wallet_present,
@@ -178,7 +200,7 @@ pub(super) fn extract_source_instruction(
             "source DEX account metas resolved"
         );
         if !source_wallet_present {
-            info!(
+            debug!(
                 dex = dex.as_str(),
                 discriminator = ?discriminator,
                 source_wallet = %source_wallet,
@@ -191,8 +213,10 @@ pub(super) fn extract_source_instruction(
             return None;
         }
         let mut wallet_token_accounts = Vec::new();
+        let wallet_string = source_wallet.to_string();
         for asset in [input_asset, output_asset] {
             let mint = asset.routing_mint();
+            let mint_string = mint.to_string();
             for balance in observed
                 .meta
                 .pre_token_balances
@@ -200,8 +224,8 @@ pub(super) fn extract_source_instruction(
                 .chain(observed.meta.post_token_balances.iter())
                 .flatten()
             {
-                if balance.owner.as_deref() != Some(&source_wallet.to_string())
-                    || Pubkey::from_str(&balance.mint).ok() != Some(mint)
+                if balance.owner.as_deref() != Some(wallet_string.as_str())
+                    || balance.mint != mint_string
                 {
                     continue;
                 }
@@ -211,12 +235,10 @@ pub(super) fn extract_source_instruction(
                 if !metas.iter().any(|meta| meta.pubkey == address) {
                     continue;
                 }
-                let Some(program) = balance
-                    .program_id
-                    .as_deref()
-                    .and_then(|program| Pubkey::from_str(program).ok())
-                else {
-                    continue;
+                let program = match balance.program_id.as_deref() {
+                    Some("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA") => spl_token::id(),
+                    Some("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb") => spl_token_2022::id(),
+                    _ => continue,
                 };
                 if [spl_token::id(), spl_token_2022::id()].contains(&program)
                     && !wallet_token_accounts
@@ -263,7 +285,7 @@ pub(super) fn extract_source_instruction(
         });
     }
     if found.is_none() && !inspected.is_empty() {
-        info!(
+        debug!(
             source_wallet = %source_wallet,
             instruction_count = inspected.len(),
             instructions = ?inspected,
@@ -297,11 +319,16 @@ fn layout(dex: DexKind, discriminator: [u8; 8]) -> Option<(usize, usize, usize)>
     }
 }
 
+#[cfg(test)]
 pub(super) fn require_pump_trade(observed: &ObservedTransaction) -> Result<()> {
-    let keys = full_account_keys(observed)?;
+    require_pump_trade_with_context(&DecodeContext::new(observed)?)
+}
+
+pub(super) fn require_pump_trade_with_context(context: &DecodeContext) -> Result<()> {
+    let keys = &context.keys;
     let mut swaps = 0_usize;
     let mut other_dex = false;
-    for instruction in all_instructions(observed)? {
+    for instruction in &context.instructions {
         let program = keys
             .get(usize::from(instruction.program_id_index))
             .ok_or_else(|| {
@@ -540,8 +567,8 @@ mod tests {
             index: 0,
             instructions: vec![UiCompiledInstruction {
                 program_id_index: swap.program_id_index,
-                accounts: swap.accounts,
-                data: bs58::encode(swap.data).into_string(),
+                accounts: swap.accounts.clone(),
+                data: bs58::encode(&swap.data).into_string(),
                 stack_height: Some(2),
             }],
         }]);
@@ -552,7 +579,19 @@ mod tests {
                 address: pool
             })
         );
+        let rpc_context = DecodeContext::new(&observed).expect("RPC context");
+        observed.meta.live_loaded_addresses = Some(vec![pool, DexKind::PumpSwap.program_id()]);
+        observed.meta.live_inner_instructions = Some(vec![swap]);
         observed.meta.loaded_addresses = None;
+        observed.meta.inner_instructions = None;
+        let live_context = DecodeContext::new(&observed).expect("live context");
+        assert_eq!(live_context.keys, rpc_context.keys);
+        assert_eq!(live_context.instructions, rpc_context.instructions);
+        assert_eq!(
+            extract_source_pool(&observed).map(|source| source.address),
+            Some(pool)
+        );
+        observed.meta.live_loaded_addresses = None;
         assert_eq!(extract_source_pool(&observed), None);
     }
 

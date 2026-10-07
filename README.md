@@ -77,14 +77,44 @@ Source-direct output uses `floor(copy_input * source_output / source_input)` and
 configured slippage. Invalid estimates and overflow are rejected. This uses the
 source trade's price rather than a fresh quote.
 
-Classic SPL Pump.fun SOL buys can reuse successful source token metadata and avoid
-a mint RPC read. Other routes inspect mints, including Token-2022 extensions.
-Native PumpSwap direct copies check only the copier's WSOL account, rather than
-fetching or scanning pools. An existing WSOL account is reported as unsupported
-to preserve the account-lifecycle safeguard; an RPC failure remains an execution
-error. Native direct copies create a WSOL ATA before the swap and close it afterward
-on both buys and sells. Wallet-derived volume and cashback accounts are rewritten
+Pump.fun and PumpSwap buys and sells reuse matching source transaction metadata,
+including Token-2022 decimals and token program IDs. Extension inspection runs in
+background; the first copy can be sent before inspection finishes. Completed
+inspection results apply to later copies. Missing or ambiguous source metadata
+falls back to mint RPC. Validated fallback reads are cached for 60 seconds (up to
+4096 mints). Caches reset when the trader restarts.
+PumpSwap `buy` and `buy_v2` request the slippage-adjusted token output and
+keep the copied input amount as the maximum spending limit. These exact-output
+buys may spend less than the configured input amount. Exact-input buys and sells
+use the slippage-adjusted output as their minimum received amount.
+
+Native PumpSwap copies keep the copier's canonical WSOL account open. Buys use
+fresh cached WSOL first and wrap only the shortfall; a missing or stale WSOL
+cache falls back to wrapping the full input without another pre-send RPC read.
+The WSOL cache is warmed at startup, refreshed in the background even when zero,
+and invalidated on submission. Confirmed PumpSwap copies refresh the WSOL
+balance for subsequent buys. Sells leave proceeds as WSOL. Account creation is
+idempotent and existing WSOL accounts are validated at startup. No automatic
+WSOL closure occurs. Native SOL remains necessary for fees, tips, and account
+creation. Timing records include `cached_wsol_lamports` and `wrap_lamports`.
+Wallet-derived volume and cashback accounts are rewritten
 for the copier when present in the source instruction.
+
+Token-to-SOL sells follow the source's sold fraction: copier token balance × source
+sold amount ÷ source pre-sell token balance, rounded down. A full source exit sells
+all held tokens of that mint in the copier's associated token account, even when
+the copied buy received fewer tokens. Buy sizing is not applied again to exits.
+Sell sizes bypass generic token-count minimum/maximum limits; zero holdings and
+fractions that round to zero are skipped. Buys and token-to-token swaps retain
+configured sizing and limits.
+
+The source denominator comes from owned pre-token balances included in the source
+transaction; accounts absent from that transaction are not counted. The copier
+balance uses the existing balance cache/read, so no additional RPC is introduced.
+Missing or inconsistent source balances reject the exit. The copier's entire
+held balance of that mint is treated as its position; use a dedicated copier
+wallet if manually held tokens of the same mint must remain separate. The journal
+records both pre-sell balances in the attempt's timing metadata for inspection.
 
 Sizing, token policy, account rewriting, signing, duplicate reservations,
 confirmation, and balance reconciliation remain enabled.
@@ -137,22 +167,44 @@ column stores the source-price output estimate. Historical schema objects for
 the original backend remain for migration compatibility but have no seeding
 runtime in this service. Connections use WAL and `synchronous=FULL`.
 
-Observation, intent, and unique attempt reservation writes are awaited before
-submission. Route and signed-transaction writes happen after the Sender response,
-including errors. A crash between sending and persisting the signature can leave
-an uncertain attempt; startup marks it `unknown` and never retries it automatically.
-Confirmed landing slots are saved before reconciliation, including on-chain failures.
+Live observation, cursor, intent, attempt, and outcome writes enter one ordered
+background journal queue. Submission does not wait for SQLite. An in-memory
+signature set claims attempts immediately and is seeded from persisted attempts
+at startup. The queue holds up to 4096 writes; a full or failed queue rejects
+new writes rather than waiting for disk. Persistence failure stops the service.
+Startup and reconnect recovery still query SQLite.
+
+A crash after sending but before the queued reservation persists can allow that
+source transaction to be copied again after restart. Pending journal records can
+also be lost. Shutdown drains accepted journal writes after stopping the service
+tasks. Connections retain WAL and `synchronous=FULL` for completed writes.
+
+Decoding shares one parsed account/instruction context across its passes. Mint
+strings are decoded once per transaction, fixed program/tip addresses are constants,
+and canonical ATA derivations use an 8192-entry cache keyed by owner, mint, and
+program. Sequential trade execution is retained.
+
+`payload_decode_us` measures LaserStream payload conversion; `observation_enqueue_us`
+measures observation journal enqueueing. `queue_wait_us` measures the time from
+starting the execution-channel send to worker receipt, including backpressure.
+`ingress_to_worker_us` includes payload conversion and the queue wait, so these
+fields overlap. `pre_decode_checks_us` covers admission checks before decoding.
+`pre_route_preparation_us` covers metadata, sizing, funding, and reservation after
+decoding. `serialization_us` and `cache_invalidation_us` isolate those operations;
+`post_route_preparation_us` includes both plus remaining pre-send bookkeeping.
+
+`decode_us`, `route_instruction_build_us`, `transaction_build_us`, and
+`transaction_sign_us` measure isolated durations. `sender_request_us` measures the
+full Sender request including network response time. `receipt_to_send_start_us`
+is a cumulative offset; existing `_complete_ms` offsets remain for compatibility.
 
 Timing JSON includes receipt-to-send offsets, preparation, route, Sender,
-confirmation, reconciliation, and measured database calls. Missing stages remain
-absent. RPC and database stages overlap, so their summed times are not wall time.
-Database durations use microseconds; most pipeline durations use milliseconds.
-
-One background task batches up to 32 timing records from a bounded 256-record
-queue. Queue overflow or write failures can drop telemetry with a warning;
-critical journal writes are separate. The queue drains when the worker finishes
-normally. Process termination, including Ctrl-C, can lose pending timing records.
-Console logging remains synchronous.
+confirmation, and reconciliation. Background database writes are excluded from
+the live execution timings. The bounded telemetry queue feeds the same ordered
+journal writer; telemetry overflow is logged. Console logs use a bounded 4096-entry background writer. If the queue fills,
+logs are dropped rather than blocking execution. Normal process exit attempts to flush
+the writer; abrupt termination can lose queued logs. Verbose decode diagnostics
+require debug logging.
 
 ```bash
 RUST_LOG=pump_copy_trader=debug cargo run -- --config config.toml run
@@ -195,3 +247,42 @@ node --check db_ui/static/app.js
 Rust tests use temporary databases and loopback mock RPC servers. They cover Pump
 rewrites, source-only routing, recovery, duplicate protection, unsupported outcomes,
 and malformed source payloads without submitting to a live network.
+
+Output reconciliation uses confirmed `getTransaction` metadata: token output is
+the transaction's post-balance minus its pre-balance, with an absent pre-balance
+treated as zero for a newly created account. Native SOL output includes the
+recorded transaction fee and configured sender tip. Output-balance RPC reads run
+after confirmation to refresh the wallet cache; submission does not wait for an
+output baseline read. `reconciliation_metadata_ms` measures metadata retrieval,
+including polling when confirmed metadata is not available yet. Retrieval is
+bounded by `confirmation_timeout_seconds`; invalid metadata produces an error
+rather than assuming a received amount.
+
+Sender accepts the global HTTPS endpoint and Helius regional HTTP endpoints
+(`slc`, `ewr`, `lon`, `fra`, `ams`, `sg`, `tyo`). For a bot hosted near Toronto,
+Newark is `http://ewr-sender.helius-rpc.com/fast`. Connection warming uses the
+configured endpoint's `/ping` path.
+
+### Receipt-to-send latency
+
+Live gRPC metadata keeps inner instruction data and loaded addresses in binary
+form. RPC recovery still accepts JSON/base58 metadata. This avoids encoding and
+then decoding the same inner instructions and addresses before submission.
+Instruction inspection details are collected only when debug logging is enabled.
+Source and copier volume PDAs are cached by program and wallet and prewarmed at
+startup; token account addresses retain their existing cache.
+
+After rebuilding and restarting, inspect recent samples with:
+
+```sh
+cargo run --release -- latency --limit 100
+```
+
+The command reports p50/p95/p99 and maximum values in microseconds, plus the
+fraction of measured submissions below 1,000 µs. Missing measurements are excluded;
+zero is a valid measurement. The limit selects recent source records, including
+skips and failures, so the measured sample count may be smaller. Sender response
+latency is reported separately from receipt-to-send. Existing records are retained,
+so use a recent window to compare after restart. Cache-miss RPC reads and the serial
+worker's confirmation/reconciliation can still increase latency during bursts.
+These optimizations alone do not establish a live sub-1 ms p95 guarantee.

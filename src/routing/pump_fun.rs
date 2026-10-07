@@ -174,11 +174,7 @@ pub(crate) fn copy_source_instruction(
         discriminator,
         BUY_V2_DISCRIMINATOR | BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR
     ) {
-        let user_volume = Pubkey::find_program_address(
-            &[b"user_volume_accumulator", copier.as_ref()],
-            &PROGRAM_ID,
-        )
-        .0;
+        let user_volume = crate::token::accounts::user_volume_address(&PROGRAM_ID, &copier);
         let quote_mint = accounts.get(2).map(|meta| meta.pubkey).ok_or_else(|| {
             CopyTraderError::Unsupported("Pump.fun quote mint is missing".to_owned())
         })?;
@@ -201,11 +197,7 @@ pub(crate) fn copy_source_instruction(
         discriminator,
         BUY_V3_DISCRIMINATOR | BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR
     ) {
-        let user_volume = Pubkey::find_program_address(
-            &[b"user_volume_accumulator", copier.as_ref()],
-            &PROGRAM_ID,
-        )
-        .0;
+        let user_volume = crate::token::accounts::user_volume_address(&PROGRAM_ID, &copier);
         accounts[V3_USER_INDEX].pubkey = copier;
         accounts[V3_USER_VOLUME_INDEX].pubkey = user_volume;
         (
@@ -350,11 +342,7 @@ fn copy_source_sell_instruction(
         accounts[quote_user_index].pubkey =
             associated_token_address(&copier, &output_mint, &quote_program);
         let volume_index = if v2 { 19 } else { 11 };
-        let user_volume = Pubkey::find_program_address(
-            &[b"user_volume_accumulator", copier.as_ref()],
-            &PROGRAM_ID,
-        )
-        .0;
+        let user_volume = crate::token::accounts::user_volume_address(&PROGRAM_ID, &copier);
         accounts[volume_index].pubkey = user_volume;
         if v2 {
             accounts[20].pubkey =
@@ -369,16 +357,9 @@ fn copy_source_sell_instruction(
             ));
         }
     } else {
-        let source_volume = Pubkey::find_program_address(
-            &[b"user_volume_accumulator", source.source_wallet.as_ref()],
-            &PROGRAM_ID,
-        )
-        .0;
-        let copier_volume = Pubkey::find_program_address(
-            &[b"user_volume_accumulator", copier.as_ref()],
-            &PROGRAM_ID,
-        )
-        .0;
+        let source_volume =
+            crate::token::accounts::user_volume_address(&PROGRAM_ID, &source.source_wallet);
+        let copier_volume = crate::token::accounts::user_volume_address(&PROGRAM_ID, &copier);
         for meta in &mut accounts {
             if meta.pubkey == source_volume {
                 meta.pubkey = copier_volume;

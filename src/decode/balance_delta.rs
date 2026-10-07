@@ -21,8 +21,17 @@ pub fn wallet_swap_delta(
     wallet_index: usize,
     native_adjustment: u64,
 ) -> Result<WalletSwapDelta> {
-    let pre = owned_balances(meta.pre_token_balances.as_deref(), wallet)?;
-    let post = owned_balances(meta.post_token_balances.as_deref(), wallet)?;
+    let mut parsed_mints = HashMap::new();
+    let pre = owned_balances(
+        meta.pre_token_balances.as_deref(),
+        wallet,
+        &mut parsed_mints,
+    )?;
+    let post = owned_balances(
+        meta.post_token_balances.as_deref(),
+        wallet,
+        &mut parsed_mints,
+    )?;
     let mut debits = Vec::new();
     let mut credits = Vec::new();
     let mints = pre
@@ -106,6 +115,7 @@ fn checked_u64(value: u128, field: &str) -> Result<u64> {
 fn owned_balances(
     balances: Option<&[UiTokenBalance]>,
     wallet: &Pubkey,
+    parsed_mints: &mut HashMap<String, Pubkey>,
 ) -> Result<HashMap<Pubkey, u64>> {
     let mut result = HashMap::new();
     let wallet = wallet.to_string();
@@ -113,9 +123,15 @@ fn owned_balances(
         if balance.owner.as_deref() != Some(wallet.as_str()) {
             continue;
         }
-        let mint = Pubkey::from_str(&balance.mint).map_err(|error| {
-            CopyTraderError::Decode(format!("invalid token-balance mint: {error}"))
-        })?;
+        let mint = if let Some(mint) = parsed_mints.get(&balance.mint) {
+            *mint
+        } else {
+            let mint = Pubkey::from_str(&balance.mint).map_err(|error| {
+                CopyTraderError::Decode(format!("invalid token-balance mint: {error}"))
+            })?;
+            parsed_mints.insert(balance.mint.clone(), mint);
+            mint
+        };
         let amount = balance
             .ui_token_amount
             .amount

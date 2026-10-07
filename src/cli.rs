@@ -21,6 +21,11 @@ pub enum Command {
     Run,
     /// Validate configuration and external dependencies without trading.
     Doctor,
+    /// Report receipt-to-send latency percentiles from recent attempted copies.
+    Latency {
+        #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..))]
+        limit: u32,
+    },
     /// Print recent source and copy-attempt records.
     Status {
         #[arg(long, default_value_t = 20)]

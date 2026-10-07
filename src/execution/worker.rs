@@ -84,8 +84,22 @@ impl ExecutionWorker {
         writer: &TimingWriter,
     ) -> Result<()> {
         while let Some(queued) = input.recv().await {
+            let worker_started = Instant::now();
+            let queue_wait_us =
+                CopyTimings::micros(worker_started.duration_since(queued.queued_at));
             let source_signature = queued.observed.signature.to_string();
             let mut timings = CopyTimings::new(queued.received_at);
+            timings.values.insert("queue_wait_us", queue_wait_us);
+            timings
+                .values
+                .insert("payload_decode_us", queued.payload_decode_us);
+            timings
+                .values
+                .insert("observation_enqueue_us", queued.observation_enqueue_us);
+            timings.values.insert(
+                "ingress_to_worker_us",
+                CopyTimings::micros(worker_started.duration_since(queued.received_at)),
+            );
             timings.database = queued.database_timings;
             self.store = self.store.with_timings(timings.database.clone());
             let result = self.handle(queued.observed, &mut timings).await;
@@ -126,6 +140,7 @@ impl ExecutionWorker {
         observed: ObservedTransaction,
         timings: &mut CopyTimings,
     ) -> Result<()> {
+        let checks_started = Instant::now();
         let source_signature = observed.signature.to_string();
         if observed.slot < self.last_executed_slot {
             self.store
@@ -145,7 +160,16 @@ impl ExecutionWorker {
                 .await?;
             return Ok(());
         }
-        let intent = match self.decoder.decode(&observed) {
+        timings.values.insert(
+            "pre_decode_checks_us",
+            CopyTimings::micros(checks_started.elapsed()),
+        );
+        let decode_started = Instant::now();
+        let decoded = self.decoder.decode(&observed);
+        timings
+            .values
+            .insert("decode_us", CopyTimings::micros(decode_started.elapsed()));
+        let intent = match decoded {
             Ok(intent) => intent,
             Err(CopyTraderError::Unsupported(reason)) => {
                 return Err(CopyTraderError::OutOfScope(
@@ -161,6 +185,7 @@ impl ExecutionWorker {
             }
             Err(error) => return Err(error),
         };
+        let preparation_started = Instant::now();
         timings.mark("decode_complete_ms");
         if intent.source_pool.is_some() {
             timings.mark("source_pool_identified_ms");
@@ -201,7 +226,7 @@ impl ExecutionWorker {
         }
         let mut routing_timings = RoutingTimings::default();
         let direct_mints =
-            direct_pump_fun_mints(&intent, observed.meta.post_token_balances.as_deref());
+            direct_source_mints(&intent, observed.meta.post_token_balances.as_deref());
         let (intent_write, reads) = tokio::join!(
             self.store.mark_intent(&source_signature, &intent),
             self.initial_reads(&intent, direct_mints),
@@ -219,24 +244,97 @@ impl ExecutionWorker {
             .values
             .insert("mint_from_source", u64::from(mint_from_source));
         let sizing = SizingPolicy::new(&self.config.sizing);
-        let sized = match sizing.size_trade(intent, &input_rule, input_info.decimals)? {
+        let input_account = associated_token_address(
+            &self.signer.pubkey(),
+            &input_mint,
+            &input_info.token_program,
+        );
+        let exiting_to_sol = matches!(intent.input_asset, AssetId::Token(_))
+            && intent.output_asset == AssetId::NativeSol;
+        let exit_balance = if exiting_to_sol {
+            Some(
+                self.cached_asset_balance(intent.input_asset, &input_account)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let result = if let Some(balance) = exit_balance {
+            let source_before = source_position_before(
+                &intent,
+                self.config.signal.wallet,
+                observed.meta.pre_token_balances.as_deref(),
+            )?;
+            timings
+                .values
+                .insert("source_position_before_raw", source_before);
+            timings.values.insert("copier_position_before_raw", balance);
+            sizing.size_exit(intent, source_before, balance)?
+        } else {
+            sizing.size_trade(intent, &input_rule, input_info.decimals)?
+        };
+        let sized = match result {
             Ok(sized) => sized,
             Err(reason) => {
                 self.store.mark_skipped(&source_signature, reason).await?;
                 return Ok(());
             }
         };
-        let input_account = associated_token_address(
-            &self.signer.pubkey(),
-            &input_mint,
-            &input_info.token_program,
-        );
-        let available = if let Some(balance) = native_balance {
+        let pump_swap_buy = sized.intent.input_asset == AssetId::NativeSol
+            && sized
+                .intent
+                .source_instruction
+                .as_ref()
+                .is_some_and(|source| {
+                    source.instruction.program_id == crate::domain::DexKind::PumpSwap.program_id()
+                });
+        let cached_wsol = if pump_swap_buy {
+            self.balance_cache.get(&input_account).await.unwrap_or(0)
+        } else {
+            0
+        };
+        let available = if let Some(balance) = exit_balance.or(native_balance) {
             balance
         } else {
             self.cached_asset_balance(sized.intent.input_asset, &input_account)
                 .await?
         };
+        let wrap_lamports = sized
+            .input_amount
+            .checked_sub(cached_wsol.min(sized.input_amount))
+            .ok_or_else(|| CopyTraderError::Execution("WSOL funding subtraction failed".into()))?;
+        let native_available = available;
+        let available = available
+            .checked_add(cached_wsol)
+            .ok_or_else(|| CopyTraderError::Execution("combined SOL balance overflow".into()))?;
+        if pump_swap_buy {
+            timings.values.insert("cached_wsol_lamports", cached_wsol);
+            timings.values.insert("wrap_lamports", wrap_lamports);
+            if cached_wsol > 0 {
+                let mainnet = self.config.mainnet.as_ref().ok_or_else(|| {
+                    CopyTraderError::Execution("mainnet configuration missing".into())
+                })?;
+                let price = mainnet.fixed_priority_fee_micro_lamports.ok_or_else(|| {
+                    CopyTraderError::Execution("fixed priority fee missing".into())
+                })?;
+                let priority = u64::from(crate::routing::pump_swap::COMPUTE_UNIT_LIMIT)
+                    .checked_mul(price)
+                    .and_then(|value| value.checked_add(999_999))
+                    .map(|value| value / 1_000_000)
+                    .ok_or_else(|| CopyTraderError::Execution("priority fee overflow".into()))?;
+                let required_native = wrap_lamports
+                    .checked_add(priority)
+                    .and_then(|value| value.checked_add(5_000))
+                    .and_then(|value| value.checked_add(mainnet.tip_lamports))
+                    .ok_or_else(|| CopyTraderError::Execution("native funding overflow".into()))?;
+                if native_available < required_native {
+                    self.store
+                        .mark_skipped(&source_signature, SkipReason::InsufficientBalance)
+                        .await?;
+                    return Ok(());
+                }
+            }
+        }
         if available < sized.input_amount {
             self.store
                 .mark_skipped(&source_signature, SkipReason::InsufficientBalance)
@@ -256,16 +354,21 @@ impl ExecutionWorker {
             return Ok(());
         }
 
+        timings.values.insert(
+            "pre_route_preparation_us",
+            CopyTimings::micros(preparation_started.elapsed()),
+        );
         timings.stage("route_ms");
         let started = Instant::now();
         let result = self
             .router
-            .build(
+            .build_with_wsol(
                 &sized,
                 self.signer.as_ref(),
                 self.backend.as_ref(),
                 self.config.execution.slippage_bps,
                 &mut routing_timings,
+                cached_wsol,
             )
             .await;
         timings.finish();
@@ -273,6 +376,9 @@ impl ExecutionWorker {
         timings
             .values
             .insert("route_wall_ms", CopyTimings::millis(started.elapsed()));
+        timings
+            .values
+            .insert("route_wall_us", CopyTimings::micros(started.elapsed()));
         timings.values.insert("route_ms", route_latency_ms);
         timings.values.extend(routing_timings.stages.snapshot());
         let winner = result?;
@@ -280,20 +386,20 @@ impl ExecutionWorker {
         timings.mark("checks_complete_ms");
         timings.stage("post_route_ms");
 
+        let post_route_started = Instant::now();
         let output_account = associated_token_address(
             &self.signer.pubkey(),
             &output_mint,
             &output_info.token_program,
         );
-        let output_before = if let Some(balance) = winner.output_balance_before {
-            balance
-        } else {
-            self.asset_balance_or_zero(sized.intent.output_asset, &output_account)
-                .await?
-        };
+        let serialization_started = Instant::now();
         let signed = bincode::serialize(&winner.transaction).map_err(|error| {
             CopyTraderError::Execution(format!("failed to serialize signed transaction: {error}"))
         })?;
+        timings.values.insert(
+            "serialization_us",
+            CopyTimings::micros(serialization_started.elapsed()),
+        );
         timings.mark("transaction_built_ms");
         let local_signature = winner
             .transaction
@@ -307,6 +413,7 @@ impl ExecutionWorker {
         timings
             .values
             .insert("db_pre_send_us", timings.database.total_us());
+        let invalidation_started = Instant::now();
         self.invalidate_balances(
             sized.intent.input_asset,
             &input_account,
@@ -314,10 +421,27 @@ impl ExecutionWorker {
             &output_account,
         )
         .await?;
+        timings.values.insert(
+            "cache_invalidation_us",
+            CopyTimings::micros(invalidation_started.elapsed()),
+        );
+        timings.values.insert(
+            "post_route_preparation_us",
+            CopyTimings::micros(post_route_started.elapsed()),
+        );
         timings.stage("sender_request_ms");
         timings.mark("sender_request_started_ms");
         timings.since_receipt("receipt_to_send_start_ms");
+        timings.values.insert(
+            "receipt_to_send_start_us",
+            CopyTimings::micros(timings.received_at.elapsed()),
+        );
+        let sender_started = Instant::now();
         let send_result = self.backend.send(&winner.transaction).await;
+        timings.values.insert(
+            "sender_request_us",
+            CopyTimings::micros(sender_started.elapsed()),
+        );
         timings.mark("sender_response_received_ms");
         timings.since_receipt("receipt_to_send_response_ms");
         timings.finish();
@@ -419,11 +543,24 @@ impl ExecutionWorker {
         }
 
         timings.stage("reconciliation_ms");
-        let (input_after, output_after, _) = tokio::try_join!(
+        let (input_after, _, wsol_after) = tokio::try_join!(
             self.asset_balance_network(sized.intent.input_asset, &input_account),
             self.asset_balance_network(sized.intent.output_asset, &output_account),
             async {
-                if sized.intent.input_asset != AssetId::NativeSol
+                if winner.route.dex == crate::domain::DexKind::PumpSwap
+                    && (sized.intent.input_asset == AssetId::NativeSol
+                        || sized.intent.output_asset == AssetId::NativeSol)
+                {
+                    self.asset_balance_network(
+                        AssetId::Token(spl_token::native_mint::id()),
+                        &associated_token_address(
+                            &self.signer.pubkey(),
+                            &spl_token::native_mint::id(),
+                            &spl_token::id(),
+                        ),
+                    )
+                    .await
+                } else if sized.intent.input_asset != AssetId::NativeSol
                     && sized.intent.output_asset != AssetId::NativeSol
                 {
                     self.asset_balance_network(AssetId::NativeSol, &self.signer.pubkey())
@@ -433,6 +570,13 @@ impl ExecutionWorker {
                 }
             }
         )?;
+        let input_after = if pump_swap_buy {
+            input_after.checked_add(wsol_after).ok_or_else(|| {
+                CopyTraderError::Execution("combined post-trade SOL balance overflow".into())
+            })?
+        } else {
+            input_after
+        };
         let spent = available.checked_sub(input_after).ok_or_else(|| {
             CopyTraderError::Execution("input balance increased after swap".to_owned())
         })?;
@@ -446,34 +590,33 @@ impl ExecutionWorker {
             );
         }
 
-        let native_cost_adjustment = if matches!(sized.intent.output_asset, AssetId::NativeSol) {
-            let fee = self
-                .backend
-                .rpc()
-                .get_fee_for_message(&winner.transaction.message)
-                .await
-                .map_err(|error| {
-                    CopyTraderError::Execution(format!(
-                        "failed to calculate landed transaction fee: {error}"
-                    ))
-                })?;
-            fee.checked_add(
-                self.backend
-                    .mainnet()
-                    .map_or(0, |mainnet| mainnet.tip_lamports()),
-            )
-            .ok_or_else(|| CopyTraderError::Execution("landed fee overflow".to_owned()))?
-        } else {
-            0
-        };
-        let adjusted_output_after = output_after
-            .checked_add(native_cost_adjustment)
-            .ok_or_else(|| CopyTraderError::Execution("output balance overflow".to_owned()))?;
-        let received = adjusted_output_after
-            .checked_sub(output_before)
-            .ok_or_else(|| {
-                CopyTraderError::Execution("output balance decreased after swap".to_owned())
-            })?;
+        let metadata_started = Instant::now();
+        let persistent_wsol_output = winner.route.dex == crate::domain::DexKind::PumpSwap
+            && sized.intent.output_asset == AssetId::NativeSol;
+        let received = super::reconcile::received_output(
+            self.backend.rpc(),
+            &local_signature,
+            if persistent_wsol_output {
+                AssetId::Token(sized.intent.output_asset.routing_mint())
+            } else {
+                sized.intent.output_asset
+            },
+            if sized.intent.output_asset == AssetId::NativeSol && !persistent_wsol_output {
+                self.signer.pubkey()
+            } else {
+                output_account
+            },
+            self.backend
+                .mainnet()
+                .map_or(0, |mainnet| mainnet.tip_lamports()),
+            Duration::from_secs(self.config.execution.confirmation_timeout_seconds),
+        )
+        .await;
+        timings.values.insert(
+            "reconciliation_metadata_ms",
+            CopyTimings::millis(metadata_started.elapsed()),
+        );
+        let received = received?;
         if received < winner.route.minimum_output {
             self.store
                 .update_attempt(
@@ -516,7 +659,15 @@ impl ExecutionWorker {
             tokio::try_join!(
                 async {
                     if let Some(infos) = direct_mints {
-                        return Ok((infos, 0, true));
+                        let input = self
+                            .token_safety
+                            .source_info(intent.input_asset.routing_mint(), infos.0)
+                            .await?;
+                        let output = self
+                            .token_safety
+                            .source_info(intent.output_asset.routing_mint(), infos.1)
+                            .await?;
+                        return Ok(((input, output), 0, true));
                     }
                     let started = Instant::now();
                     let infos = self
@@ -558,6 +709,13 @@ impl ExecutionWorker {
         output_account: &Pubkey,
     ) -> Result<()> {
         self.balance_cache.invalidate(&self.signer.pubkey()).await?;
+        self.balance_cache
+            .invalidate(&associated_token_address(
+                &self.signer.pubkey(),
+                &spl_token::native_mint::id(),
+                &spl_token::id(),
+            ))
+            .await?;
         for (asset, account) in [(input, input_account), (output, output_account)] {
             if asset != AssetId::NativeSol {
                 self.balance_cache.invalidate(account).await?;
@@ -587,10 +745,41 @@ impl ExecutionWorker {
             )
             .await
     }
+}
 
-    async fn asset_balance_or_zero(&self, asset: AssetId, token_account: &Pubkey) -> Result<u64> {
-        self.cached_asset_balance(asset, token_account).await
+fn source_position_before(
+    intent: &TradeIntent,
+    wallet: Pubkey,
+    balances: Option<&[UiTokenBalance]>,
+) -> Result<u64> {
+    let wallet = wallet.to_string();
+    let mint = intent.input_asset.routing_mint().to_string();
+    let mut before = 0_u64;
+    let mut seen = std::collections::HashSet::new();
+    for row in balances
+        .unwrap_or_default()
+        .iter()
+        .filter(|row| row.owner.as_deref() == Some(wallet.as_str()) && row.mint == mint)
+    {
+        if !seen.insert(row.account_index) {
+            return Err(CopyTraderError::Decode(
+                "duplicate source position balance".to_owned(),
+            ));
+        }
+        let amount =
+            row.ui_token_amount.amount.parse::<u64>().map_err(|_| {
+                CopyTraderError::Decode("invalid source position balance".to_owned())
+            })?;
+        before = before.checked_add(amount).ok_or_else(|| {
+            CopyTraderError::Decode("source position balance overflow".to_owned())
+        })?;
     }
+    if before == 0 {
+        return Err(CopyTraderError::Decode(
+            "missing source pre-sell position balance".to_owned(),
+        ));
+    }
+    Ok(before)
 }
 
 struct InitialReads {
@@ -601,62 +790,56 @@ struct InitialReads {
     mint_from_source: bool,
 }
 
-fn direct_pump_fun_mints(
+fn direct_source_mints(
     intent: &TradeIntent,
     post_balances: Option<&[UiTokenBalance]>,
 ) -> Option<(MintInfo, MintInfo)> {
-    if intent.input_asset != AssetId::NativeSol || intent.source_pool.is_some() {
-        return None;
-    }
-    let AssetId::Token(output_mint) = intent.output_asset else {
-        return None;
-    };
     let source = intent.source_instruction.as_ref()?;
-    if source.instruction.program_id != pump_fun::PROGRAM_ID
-        || !pump_fun::is_buy(&source.instruction.data)
-    {
+    let program = source.instruction.program_id;
+    if program != pump_fun::PROGRAM_ID && program != crate::domain::DexKind::PumpSwap.program_id() {
         return None;
     }
-    let output_ata =
-        associated_token_address(&source.source_wallet, &output_mint, &spl_token::id());
-    let mut output_accounts = source
-        .wallet_token_accounts
-        .iter()
-        .filter(|(_, mint, _)| *mint == output_mint);
-    if !matches!(output_accounts.next(), Some((address, _, program)) if *address == output_ata && *program == spl_token::id())
-        || output_accounts.next().is_some()
-        || !source
-            .instruction
-            .accounts
+    let balances = post_balances?;
+    let info = |asset: AssetId| -> Option<MintInfo> {
+        if asset.routing_mint() == AssetId::NativeSol.routing_mint() {
+            return Some(crate::token::extensions::native_mint_info());
+        }
+        let mint = asset.routing_mint();
+        let mut accounts = source
+            .wallet_token_accounts
             .iter()
-            .any(|meta| meta.pubkey == output_ata)
-    {
-        return None;
-    }
-    let source_wallet = source.source_wallet.to_string();
-    let output_mint = output_mint.to_string();
-    let token_program = spl_token::id().to_string();
-    let mut matching = post_balances?.iter().filter(|balance| {
-        balance.owner.as_deref() == Some(source_wallet.as_str())
-            && balance.mint == output_mint
-            && balance.program_id.as_deref() == Some(token_program.as_str())
-    });
-    let output = matching.next()?;
-    if matching.next().is_some() {
-        return None;
-    }
-    Some((
-        MintInfo {
-            decimals: 9,
-            token_program: spl_token::id(),
+            .filter(|(_, known_mint, _)| *known_mint == mint);
+        let (address, _, token_program) = accounts.next()?;
+        if accounts.next().is_some()
+            || (*token_program != spl_token::id() && *token_program != spl_token_2022::id())
+            || *address != associated_token_address(&source.source_wallet, &mint, token_program)
+            || !source
+                .instruction
+                .accounts
+                .iter()
+                .any(|meta| meta.pubkey == *address)
+        {
+            return None;
+        }
+        let wallet_string = source.source_wallet.to_string();
+        let mint_string = mint.to_string();
+        let program_string = token_program.to_string();
+        let mut matching = balances.iter().filter(|balance| {
+            balance.owner.as_deref() == Some(wallet_string.as_str())
+                && balance.mint == mint_string
+                && balance.program_id.as_deref() == Some(program_string.as_str())
+        });
+        let balance = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        Some(MintInfo {
+            decimals: balance.ui_token_amount.decimals,
+            token_program: *token_program,
             has_transfer_fee: false,
-        },
-        MintInfo {
-            decimals: output.ui_token_amount.decimals,
-            token_program: spl_token::id(),
-            has_transfer_fee: false,
-        },
-    ))
+        })
+    };
+    Some((info(intent.input_asset)?, info(intent.output_asset)?))
 }
 
 struct CopyTimings {
@@ -692,6 +875,10 @@ impl CopyTimings {
         serde_json::to_string(&values).map_err(Into::into)
     }
 
+    fn micros(duration: Duration) -> u64 {
+        u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+    }
+
     fn millis(duration: Duration) -> u64 {
         u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
     }
@@ -718,6 +905,52 @@ impl CopyTimings {
 #[cfg(test)]
 mod timing_tests {
     use super::*;
+
+    #[test]
+    fn source_sell_position_uses_only_owned_input_mint_balances() {
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let intent = TradeIntent {
+            source_pool: None,
+            source_instruction: None,
+            source_signature: Default::default(),
+            slot: 1,
+            input_asset: AssetId::Token(mint),
+            output_asset: AssetId::NativeSol,
+            source_input_amount: 50,
+            source_output_amount: 10,
+        };
+        let row = |account_index, owner: Pubkey, mint: Pubkey, amount| UiTokenBalance {
+            account_index,
+            mint: mint.to_string(),
+            owner: Some(owner.to_string()),
+            program_id: Some(spl_token::id().to_string()),
+            ui_token_amount: crate::domain::UiTokenAmount {
+                amount: format!("{amount}"),
+                decimals: 6,
+            },
+        };
+        let rows = vec![
+            row(1, owner, mint, 40),
+            row(2, owner, mint, 60),
+            row(3, Pubkey::new_unique(), mint, 1000),
+            row(4, owner, Pubkey::new_unique(), 1000),
+        ];
+        assert_eq!(
+            source_position_before(&intent, owner, Some(&rows)).expect("source position"),
+            100
+        );
+        assert!(source_position_before(&intent, owner, None).is_err());
+        let mut duplicate = rows.clone();
+        duplicate.push(rows[0].clone());
+        assert!(source_position_before(&intent, owner, Some(&duplicate)).is_err());
+        let mut malformed = rows.clone();
+        malformed[0].ui_token_amount.amount = "bad".to_owned();
+        assert!(source_position_before(&intent, owner, Some(&malformed)).is_err());
+        let overflow = vec![row(1, owner, mint, u64::MAX), row(2, owner, mint, 1)];
+        assert!(source_position_before(&intent, owner, Some(&overflow)).is_err());
+    }
+
     use solana_sdk::instruction::{AccountMeta, Instruction};
 
     #[test]
@@ -754,7 +987,7 @@ mod timing_tests {
             owner: Some(wallet.to_string()),
             program_id: Some(spl_token::id().to_string()),
         };
-        let infos = direct_pump_fun_mints(&intent, Some(std::slice::from_ref(&balance)))
+        let infos = direct_source_mints(&intent, Some(std::slice::from_ref(&balance)))
             .expect("direct mint evidence");
         assert_eq!(infos.0.decimals, 9);
         assert_eq!(infos.1.decimals, 6);
@@ -763,8 +996,8 @@ mod timing_tests {
 
         let mut unsupported = balance.clone();
         unsupported.program_id = Some(spl_token_2022::id().to_string());
-        assert!(direct_pump_fun_mints(&intent, Some(&[unsupported])).is_none());
-        assert!(direct_pump_fun_mints(&intent, None).is_none());
+        assert!(direct_source_mints(&intent, Some(&[unsupported])).is_none());
+        assert!(direct_source_mints(&intent, None).is_none());
         let mut ambiguous = intent.clone();
         ambiguous
             .source_instruction
@@ -772,7 +1005,7 @@ mod timing_tests {
             .unwrap()
             .wallet_token_accounts
             .push((Pubkey::new_unique(), mint, spl_token_2022::id()));
-        assert!(direct_pump_fun_mints(&ambiguous, Some(std::slice::from_ref(&balance))).is_none());
+        assert!(direct_source_mints(&ambiguous, Some(std::slice::from_ref(&balance))).is_none());
         let mut wrong_instruction = intent.clone();
         wrong_instruction
             .source_instruction
@@ -780,7 +1013,55 @@ mod timing_tests {
             .unwrap()
             .instruction
             .program_id = Pubkey::new_unique();
-        assert!(direct_pump_fun_mints(&wrong_instruction, Some(&[balance])).is_none());
+        assert!(direct_source_mints(&wrong_instruction, Some(&[balance])).is_none());
+    }
+
+    #[test]
+    fn pump_swap_token_2022_metadata_supports_buys_and_sells() {
+        let wallet = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let program = spl_token_2022::id();
+        let ata = associated_token_address(&wallet, &mint, &program);
+        let mut intent = TradeIntent {
+            source_pool: Some(crate::domain::SourcePool {
+                dex: crate::domain::DexKind::PumpSwap,
+                address: Pubkey::new_unique(),
+            }),
+            source_instruction: Some(crate::domain::SourceInstruction {
+                instruction: Instruction {
+                    program_id: crate::domain::DexKind::PumpSwap.program_id(),
+                    accounts: vec![AccountMeta::new(ata, false)],
+                    data: [pump_fun::BUY_DISCRIMINATOR.as_slice(), &[0; 16]].concat(),
+                },
+                source_wallet: wallet,
+                wallet_token_accounts: vec![(ata, mint, program)],
+            }),
+            source_signature: Default::default(),
+            slot: 42,
+            input_asset: AssetId::NativeSol,
+            output_asset: AssetId::Token(mint),
+            source_input_amount: 100,
+            source_output_amount: 200,
+        };
+        let balance = UiTokenBalance {
+            account_index: 0,
+            mint: mint.to_string(),
+            ui_token_amount: crate::domain::UiTokenAmount {
+                amount: "200".to_owned(),
+                decimals: 6,
+            },
+            owner: Some(wallet.to_string()),
+            program_id: Some(program.to_string()),
+        };
+        let buy = direct_source_mints(&intent, Some(std::slice::from_ref(&balance))).unwrap();
+        assert_eq!(buy.0.decimals, 9);
+        assert_eq!(buy.1.token_program, program);
+        assert_eq!(buy.1.decimals, 6);
+        std::mem::swap(&mut intent.input_asset, &mut intent.output_asset);
+        let sell = direct_source_mints(&intent, Some(std::slice::from_ref(&balance))).unwrap();
+        assert_eq!(sell.0.token_program, program);
+        assert_eq!(sell.1.decimals, 9);
+        assert!(direct_source_mints(&intent, Some(&[balance.clone(), balance])).is_none());
     }
 
     #[tokio::test]
@@ -796,6 +1077,9 @@ mod timing_tests {
         let server = TestRpc::start(|request| match request["method"].as_str().unwrap() {
             "getVersion" => json!({"solana-core":"3.1.0","feature-set":1}),
             "getBalance" => json!({"context":{"slot":42},"value":1_000_000}),
+            "getAccountInfo" => {
+                json!({"context":{"slot":42},"value":crate::test_rpc::mint_account()})
+            }
             method => panic!("unexpected RPC {method}"),
         })
         .await;
@@ -1011,6 +1295,9 @@ mod timing_tests {
             .send(QueuedObservation {
                 observed,
                 received_at: Instant::now() - Duration::from_millis(10),
+                queued_at: Instant::now() - Duration::from_millis(5),
+                payload_decode_us: 123,
+                observation_enqueue_us: 45,
                 database_timings: database_timings.clone(),
             })
             .await
@@ -1026,6 +1313,9 @@ mod timing_tests {
         assert!(saved["database"].get("record_timings").is_none());
         assert!(!database_timings.snapshot().contains_key("record_timings"));
         assert!(saved["ingestion_queue_ms"].as_u64().expect("delay") >= 10);
+        assert!(saved["queue_wait_us"].as_u64().expect("queue wait") >= 5000);
+        assert_eq!(saved["payload_decode_us"], 123);
+        assert_eq!(saved["observation_enqueue_us"], 45);
     }
 
     #[tokio::test]
@@ -1162,6 +1452,7 @@ mod unsupported_tests {
     #[tokio::test]
     async fn unsupported_sources_do_not_send_and_next_valid_pump_copy_lands() {
         let token_reads = AtomicUsize::new(0);
+        let landed_metadata = std::sync::Mutex::new(serde_json::Value::Null);
         let server = TestRpc::start(move |request| match request["method"].as_str().expect("method") {
             "getVersion" => json!({"solana-core":"3.1.0","feature-set":1}),
             "getLatestBlockhash" => json!({"context":{"slot":42},"value":{"blockhash":Hash::new_unique().to_string(),"lastValidBlockHeight":1000}}),
@@ -1173,15 +1464,24 @@ mod unsupported_tests {
                 json!({"context":{"slot":42},"value":[mint_account(),invalid]})
             }
             "getTokenAccountBalance" => {
-                let amount = if token_reads.fetch_add(1, Ordering::SeqCst) == 0 { "0" } else { "1000" };
-                json!({"context":{"slot":42},"value":{"amount":amount,"decimals":6,"uiAmount":0.0,"uiAmountString":"0"}})
+                token_reads.fetch_add(1, Ordering::SeqCst);
+                json!({"context":{"slot":43},"value":{"amount":"1000","decimals":6,"uiAmount":0.001,"uiAmountString":"0.001"}})
             }
             "sendTransaction" => {
                 let signed = STANDARD.decode(request["params"][0].as_str().expect("encoded transaction")).expect("base64");
                 let transaction: Transaction = bincode::deserialize(&signed).expect("transaction");
                 assert!(transaction.verify().is_ok());
+                assert_eq!(token_reads.load(Ordering::SeqCst), 0, "output RPC must follow submission");
+                let swap = transaction.message.instructions.iter().find(|instruction| transaction.message.account_keys[usize::from(instruction.program_id_index)] == pump_fun::PROGRAM_ID).expect("swap");
+                let output_index = swap.accounts[5];
+                let mint = transaction.message.account_keys[usize::from(swap.accounts[2])];
+                *landed_metadata.lock().expect("metadata") = json!({
+                    "transaction":{"message":{"accountKeys":transaction.message.account_keys.iter().map(ToString::to_string).collect::<Vec<_>>() }},
+                    "meta":{"err":null,"preTokenBalances":[],"postTokenBalances":[{"accountIndex":output_index,"mint":mint.to_string(),"uiTokenAmount":{"amount":"1000"}}]}
+                });
                 json!(transaction.signatures[0].to_string())
             }
+            "getTransaction" => landed_metadata.lock().expect("metadata").clone(),
             "getSignatureStatuses" => json!({"context":{"slot":43},"value":[{"slot":43,"confirmations":1,"err":null,"status":{"Ok":null},"confirmationStatus":"confirmed"}]}),
             method => panic!("unexpected RPC {method}"),
         }).await;
@@ -1265,6 +1565,9 @@ mod unsupported_tests {
                 .send(QueuedObservation {
                     observed,
                     received_at: Instant::now(),
+                    queued_at: Instant::now(),
+                    payload_decode_us: 0,
+                    observation_enqueue_us: 0,
                     database_timings: DatabaseTimings::default(),
                 })
                 .await
@@ -1325,8 +1628,8 @@ mod unsupported_tests {
         );
         assert_eq!(
             server.count("getTokenAccountBalance"),
-            2,
-            "baseline and reconciliation only"
+            1,
+            "output cache refresh only, after submission"
         );
         assert_eq!(server.count("sendTransaction"), 1);
         assert_eq!(server.count("simulateTransaction"), 0);

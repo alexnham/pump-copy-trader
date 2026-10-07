@@ -163,6 +163,7 @@ impl WalletBalanceCache {
             .iter()
             .filter(|(_, account)| {
                 account.asset == AssetId::NativeSol
+                    || account.asset == AssetId::Token(spl_token::native_mint::id())
                     || account.entry.is_none_or(|entry| entry.amount > 0)
             })
             .map(|(address, account)| (*address, account.asset, account.owner))
@@ -205,6 +206,59 @@ mod tests {
 
     fn balance(amount: u64) -> serde_json::Value {
         json!({"context":{"slot":42},"value":{"amount":amount.to_string(),"decimals":6,"uiAmount":null,"uiAmountString":"0"}})
+    }
+
+    #[tokio::test]
+    async fn zero_wsol_keeps_refreshing_and_stale_or_invalidated_entries_are_not_reused() {
+        let owner = Pubkey::new_unique();
+        let mint = spl_token::native_mint::id();
+        let address = associated_token_address(&owner, &mint, &spl_token::id());
+        let reads = AtomicUsize::new(0);
+        let server =
+            TestRpc::start(
+                move |request| match request["method"].as_str().expect("method") {
+                    "getBalance" => json!({"context":{"slot":42},"value":1_000_000}),
+                    "getTokenAccountBalance" => {
+                        balance(if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                            0
+                        } else {
+                            200
+                        })
+                    }
+                    method => panic!("unexpected {method}"),
+                },
+            )
+            .await;
+        let transport = HttpTransport::new(&HttpConfig::default()).expect("transport");
+        let rpc = transport.solana_rpc(&server.url);
+        let cache = WalletBalanceCache::default();
+        assert_eq!(
+            cache
+                .fetch(&rpc, AssetId::Token(mint), owner, address)
+                .await
+                .expect("warm"),
+            0
+        );
+        cache.refresh(&rpc, owner, &[]).await;
+        assert_eq!(cache.get(&address).await, Some(200));
+        assert_eq!(server.count("getTokenAccountBalance"), 2);
+        cache
+            .accounts
+            .write()
+            .await
+            .get_mut(&address)
+            .expect("watched")
+            .entry
+            .as_mut()
+            .expect("entry")
+            .requested_at = Instant::now() - Duration::from_secs(2);
+        assert_eq!(cache.get(&address).await, None);
+        cache
+            .fetch(&rpc, AssetId::Token(mint), owner, address)
+            .await
+            .expect("refresh");
+        cache.invalidate(&address).await.expect("invalidate");
+        assert_eq!(cache.get(&address).await, None);
     }
 
     #[tokio::test]

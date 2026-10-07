@@ -1,6 +1,7 @@
 mod backend;
 pub mod cache;
 mod confirm;
+mod reconcile;
 mod sizing;
 mod worker;
 

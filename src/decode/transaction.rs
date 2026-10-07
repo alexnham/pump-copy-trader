@@ -23,7 +23,8 @@ impl TransactionDecoder {
                 "source transaction failed".to_owned(),
             ));
         }
-        super::source_route::require_pump_trade(observed)?;
+        let context = DecodeContext::new(observed)?;
+        super::source_route::require_pump_trade_with_context(&context)?;
         let message = &observed.transaction.message;
         let source_index = message
             .static_account_keys()
@@ -37,15 +38,16 @@ impl TransactionDecoder {
                 "source wallet did not sign the transaction".to_owned(),
             ));
         }
-        let native_adjustment = native_adjustment(observed, source_index)?;
+        let native_adjustment = native_adjustment(observed, source_index, &context)?;
         let delta = wallet_swap_delta(
             &observed.meta,
             &self.source_wallet,
             source_index,
             native_adjustment,
         )?;
-        let source_instruction = super::source_route::extract_source_instruction(
+        let source_instruction = super::source_route::extract_source_instruction_with_context(
             observed,
+            &context,
             self.source_wallet,
             delta.input_asset,
             delta.output_asset,
@@ -58,7 +60,7 @@ impl TransactionDecoder {
             )
         })?;
         Ok(TradeIntent {
-            source_pool: super::source_route::extract_source_pool(observed),
+            source_pool: super::source_route::extract_source_pool_with_context(&context),
             source_instruction: Some(source_instruction),
             source_signature: observed.signature,
             slot: observed.slot,
@@ -70,13 +72,17 @@ impl TransactionDecoder {
     }
 }
 
-fn native_adjustment(observed: &ObservedTransaction, wallet_index: usize) -> Result<u64> {
-    let keys = full_account_keys(observed)?;
+fn native_adjustment(
+    observed: &ObservedTransaction,
+    wallet_index: usize,
+    context: &DecodeContext,
+) -> Result<u64> {
+    let keys = &context.keys;
     let system_program = Pubkey::default();
     let wallet_index = u8::try_from(wallet_index)
         .map_err(|_| CopyTraderError::Decode("wallet account index exceeds u8".to_owned()))?;
     let mut adjustment = 0_u64;
-    for instruction in all_instructions(observed)? {
+    for instruction in &context.instructions {
         let Some(program_id) = keys.get(usize::from(instruction.program_id_index)) else {
             continue;
         };
@@ -131,8 +137,25 @@ fn native_adjustment(observed: &ObservedTransaction, wallet_index: usize) -> Res
     Ok(adjustment)
 }
 
+pub(super) struct DecodeContext {
+    pub keys: Vec<Pubkey>,
+    pub instructions: Vec<CompiledInstruction>,
+}
+impl DecodeContext {
+    pub fn new(observed: &ObservedTransaction) -> Result<Self> {
+        Ok(Self {
+            keys: full_account_keys(observed)?,
+            instructions: all_instructions(observed)?,
+        })
+    }
+}
+
 pub(super) fn all_instructions(observed: &ObservedTransaction) -> Result<Vec<CompiledInstruction>> {
     let mut instructions = observed.transaction.message.instructions().to_vec();
+    if let Some(inner) = &observed.meta.live_inner_instructions {
+        instructions.extend_from_slice(inner);
+        return Ok(instructions);
+    }
     for group in observed
         .meta
         .inner_instructions
@@ -156,6 +179,10 @@ pub(super) fn all_instructions(observed: &ObservedTransaction) -> Result<Vec<Com
 
 pub(super) fn full_account_keys(observed: &ObservedTransaction) -> Result<Vec<Pubkey>> {
     let mut keys = observed.transaction.message.static_account_keys().to_vec();
+    if let Some(loaded) = &observed.meta.live_loaded_addresses {
+        keys.extend_from_slice(loaded);
+        return Ok(keys);
+    }
     if let Some(loaded) = &observed.meta.loaded_addresses {
         for address in loaded.writable.iter().chain(&loaded.readonly) {
             keys.push(Pubkey::from_str(address).map_err(|error| {
@@ -167,18 +194,17 @@ pub(super) fn full_account_keys(observed: &ObservedTransaction) -> Result<Vec<Pu
 }
 
 fn is_known_tip_account(account: &Pubkey) -> bool {
-    const TIPS: [&str; 10] = [
-        "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
-        "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
-        "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta",
-        "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
-        "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD",
-        "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ",
-        "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF",
-        "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT",
-        "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey",
-        "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or",
+    const TIPS: [Pubkey; 10] = [
+        Pubkey::from_str_const("4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE"),
+        Pubkey::from_str_const("D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ"),
+        Pubkey::from_str_const("9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta"),
+        Pubkey::from_str_const("5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn"),
+        Pubkey::from_str_const("2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD"),
+        Pubkey::from_str_const("2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ"),
+        Pubkey::from_str_const("wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF"),
+        Pubkey::from_str_const("3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT"),
+        Pubkey::from_str_const("4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey"),
+        Pubkey::from_str_const("4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or"),
     ];
-    TIPS.iter()
-        .any(|value| value.parse::<Pubkey>().ok().as_ref() == Some(account))
+    TIPS.contains(account)
 }

@@ -8,3 +8,5 @@ pub use timings::DatabaseTimings;
 
 mod timing_writer;
 pub(crate) use timing_writer::TimingWriter;
+
+mod journal;

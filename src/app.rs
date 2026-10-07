@@ -31,6 +31,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Run => run_service(config, store).await,
         Command::Doctor => doctor(&config, &store).await,
         Command::Status { limit } => status(&store, limit).await,
+        Command::Latency { limit } => latency(&store, limit).await,
     }
 }
 
@@ -39,6 +40,13 @@ async fn run_service(config: Arc<AppConfig>, store: Store) -> Result<()> {
     let api_key = required_env("HELIUS_API_KEY")?;
     let keypair_path = required_env("COPY_TRADER_KEYPAIR_PATH")?;
     let signer = Arc::new(load_keypair(Path::new(&keypair_path))?);
+    for program in [
+        crate::domain::DexKind::PumpSwap.program_id(),
+        crate::routing::pump_fun::PROGRAM_ID,
+    ] {
+        crate::token::accounts::user_volume_address(&program, &signer.pubkey());
+        crate::token::accounts::user_volume_address(&program, &config.signal.wallet);
+    }
     let laserstream_endpoint = config.laserstream_endpoint(&api_key)?;
     let helius_http = config.helius_http_url(&api_key)?;
     let transport = HttpTransport::new(&config.http)?;
@@ -49,7 +57,28 @@ async fn run_service(config: Arc<AppConfig>, store: Store) -> Result<()> {
         mainnet.warm_sender().await;
     }
     resolve_uncertain(&store, &backend).await?;
+    let wsol = associated_token_address(
+        &signer.pubkey(),
+        &spl_token::native_mint::id(),
+        &spl_token::id(),
+    );
+    let existing = backend
+        .rpc()
+        .get_account_with_commitment(
+            &wsol,
+            solana_commitment_config::CommitmentConfig::confirmed(),
+        )
+        .await
+        .map_err(|error| {
+            CopyTraderError::Execution(format!(
+                "cannot validate copier WSOL account at startup: {error}"
+            ))
+        })?;
+    if let Some(account) = existing.value {
+        crate::token::accounts::validate_wsol_account(&account, &signer.pubkey())?;
+    }
 
+    let (store, mut journal_writer) = store.background_journal().await?;
     let recovery = RecoveryClient::new(
         helius_http.clone(),
         config.signal.wallet,
@@ -76,6 +105,14 @@ async fn run_service(config: Arc<AppConfig>, store: Store) -> Result<()> {
         std::time::Duration::from_millis(config.routing.timeout_ms),
     ));
     let balance_cache = WalletBalanceCache::default();
+    balance_cache
+        .fetch(
+            &execution_rpc,
+            crate::domain::AssetId::Token(spl_token::native_mint::id()),
+            signer.pubkey(),
+            wsol,
+        )
+        .await?;
     tokio::spawn(balance_cache.clone().run(
         execution_rpc.clone(),
         signer.pubkey(),
@@ -99,8 +136,8 @@ async fn run_service(config: Arc<AppConfig>, store: Store) -> Result<()> {
         wallet = %compact_id(config.signal.wallet.to_string()),
         "starting tracking wallet stream"
     );
-    let source_task = tokio::spawn(async move { source.run(sender).await });
-    let worker_task = tokio::spawn(async move { worker.run(receiver).await });
+    let mut source_task = tokio::spawn(async move { source.run(sender).await });
+    let mut worker_task = tokio::spawn(async move { worker.run(receiver).await });
     info!(wallet = %compact_id(config.signal.wallet.to_string()), target = backend.label(), "copy trader running");
 
     let sender_warming = async {
@@ -110,16 +147,32 @@ async fn run_service(config: Arc<AppConfig>, store: Store) -> Result<()> {
             std::future::pending::<()>().await;
         }
     };
-    tokio::select! {
+    let mut journal_finished = false;
+    let mut source_finished = false;
+    let mut worker_finished = false;
+    let result = tokio::select! {
+        result = journal_writer.wait() => { journal_finished = true; result },
         () = sender_warming => Ok(()),
-        result = source_task => join_result("signal source", result),
-        result = worker_task => join_result("execution worker", result),
+        result = &mut source_task => { source_finished = true; join_result("signal source", result) },
+        result = &mut worker_task => { worker_finished = true; join_result("execution worker", result) },
         signal = tokio::signal::ctrl_c() => {
             signal.map_err(CopyTraderError::Io)?;
             info!("shutdown requested");
             Ok(())
         }
+    };
+    source_task.abort();
+    worker_task.abort();
+    if !source_finished {
+        let _ = source_task.await;
     }
+    if !worker_finished {
+        let _ = worker_task.await;
+    }
+    if !journal_finished {
+        journal_writer.wait().await?;
+    }
+    result
 }
 
 async fn doctor(config: &AppConfig, store: &Store) -> Result<()> {
@@ -169,6 +222,54 @@ async fn doctor(config: &AppConfig, store: &Store) -> Result<()> {
         println!("copier SOL balance: {lamports} lamports");
     }
     println!("SQLite schema: ok");
+    Ok(())
+}
+
+async fn latency(store: &Store, limit: u32) -> Result<()> {
+    let rows = store.status(limit).await?;
+    let timings = rows
+        .iter()
+        .filter_map(|row| {
+            row.timings_json
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        })
+        .collect::<Vec<_>>();
+    for key in [
+        "receipt_to_send_start_us",
+        "payload_decode_us",
+        "ingress_to_worker_us",
+        "queue_wait_us",
+        "route_wall_us",
+        "sender_request_us",
+    ] {
+        let mut values = timings
+            .iter()
+            .filter_map(|timing| timing[key].as_u64())
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        if values.is_empty() {
+            println!("{key}: no samples");
+            continue;
+        }
+        let percentile = |percent: usize| values[(values.len() * percent).div_ceil(100) - 1];
+        println!(
+            "{key}: samples={} p50={} p95={} p99={} max={}",
+            values.len(),
+            percentile(50),
+            percentile(95),
+            percentile(99),
+            values[values.len() - 1]
+        );
+        if key == "receipt_to_send_start_us" {
+            let below = values.iter().filter(|&&value| value < 1000).count();
+            println!(
+                "receipt_to_send_under_1ms: {below}/{} ({:.1}%)",
+                values.len(),
+                below as f64 * 100.0 / values.len() as f64
+            );
+        }
+    }
     Ok(())
 }
 

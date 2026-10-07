@@ -154,38 +154,51 @@ impl SignalSource for LaserstreamSource {
                     }
                     last_slot = Some(slot.slot);
                 }
-                Some(UpdateOneof::Transaction(_)) => match decode_update(update) {
-                    Ok(Some(observed)) => {
-                        let signature = observed.signature.to_string();
-                        let slot = observed.slot;
-                        let received_bytes = observed.received_bytes;
-                        let database_timings = crate::storage::DatabaseTimings::default();
-                        let recorded = self
-                            .store
-                            .with_timings(database_timings.clone())
-                            .record_observation(&observed)
-                            .await?;
-                        if !recorded {
-                            continue;
+                Some(UpdateOneof::Transaction(_)) => {
+                    let payload_started = std::time::Instant::now();
+                    let decoded = decode_update(update);
+                    let payload_decode_us =
+                        u64::try_from(payload_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                    match decoded {
+                        Ok(Some(observed)) => {
+                            let signature = observed.signature.to_string();
+                            let slot = observed.slot;
+                            let received_bytes = observed.received_bytes;
+                            let database_timings = crate::storage::DatabaseTimings::default();
+                            let observation_started = std::time::Instant::now();
+                            let recorded = self
+                                .store
+                                .with_timings(database_timings.clone())
+                                .record_observation(&observed)
+                                .await?;
+                            if !recorded {
+                                continue;
+                            }
+                            output
+                                .send(super::QueuedObservation {
+                                    observed,
+                                    received_at,
+                                    queued_at: std::time::Instant::now(),
+                                    payload_decode_us,
+                                    observation_enqueue_us: u64::try_from(
+                                        observation_started.elapsed().as_micros(),
+                                    )
+                                    .unwrap_or(u64::MAX),
+                                    database_timings,
+                                })
+                                .await
+                                .map_err(|_| {
+                                    CopyTraderError::Signal("execution worker stopped".to_owned())
+                                })?;
+                            self.store
+                                .update_cursor(&self.wallet.to_string(), &signature, slot)
+                                .await?;
+                            debug!(received_bytes, slot, source = %compact_id(&signature), "signal queued");
                         }
-                        output
-                            .send(super::QueuedObservation {
-                                observed,
-                                received_at,
-                                database_timings,
-                            })
-                            .await
-                            .map_err(|_| {
-                                CopyTraderError::Signal("execution worker stopped".to_owned())
-                            })?;
-                        self.store
-                            .update_cursor(&self.wallet.to_string(), &signature, slot)
-                            .await?;
-                        debug!(received_bytes, slot, source = %compact_id(&signature), "signal queued");
+                        Ok(None) => {}
+                        Err(error) => warn!(%error, "invalid signal discarded"),
                     }
-                    Ok(None) => {}
-                    Err(error) => warn!(%error, "invalid signal discarded"),
-                },
+                }
                 _ => {}
             }
         }

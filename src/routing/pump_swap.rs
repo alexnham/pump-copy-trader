@@ -5,12 +5,26 @@ use crate::{
 };
 use solana_sdk::pubkey::Pubkey;
 
+pub(crate) const COMPUTE_UNIT_LIMIT: u32 = 350_000;
+
+#[cfg(test)]
 pub(crate) fn copy_source_instruction(
     source: &SourceInstruction,
     trade: &SizedTrade,
     copier: Pubkey,
     expected_output: u64,
     minimum_output: u64,
+) -> Result<PreparedRoute> {
+    copy_source_instruction_with_wsol(source, trade, copier, expected_output, minimum_output, 0)
+}
+
+pub(crate) fn copy_source_instruction_with_wsol(
+    source: &SourceInstruction,
+    trade: &SizedTrade,
+    copier: Pubkey,
+    expected_output: u64,
+    minimum_output: u64,
+    cached_wsol: u64,
 ) -> Result<PreparedRoute> {
     if (trade.intent.input_asset == AssetId::NativeSol
         || trade.intent.output_asset == AssetId::NativeSol)
@@ -49,7 +63,7 @@ pub(crate) fn copy_source_instruction(
         [51, 230, 133, 164, 1, 127, 131, 173] => (trade.input_amount, minimum_output),
         // buy / buy_v2: exact base output, maximum quote input.
         [102, 6, 61, 18, 1, 218, 235, 234] | [198, 46, 21, 82, 180, 217, 232, 112] => {
-            (expected_output, trade.input_amount)
+            (minimum_output, trade.input_amount)
         }
         // sell / sell_v2 / the supported exact-input sell layout.
         [184, 23, 238, 97, 103, 197, 211, 61]
@@ -69,9 +83,12 @@ pub(crate) fn copy_source_instruction(
     }
     data[8..16].copy_from_slice(&first.to_le_bytes());
     data[16..24].copy_from_slice(&second.to_le_bytes());
-    let source_volume =
-        pump_rust_client::pda::pump_amm::user_volume_accumulator(&source.source_wallet).0;
-    let copier_volume = pump_rust_client::pda::pump_amm::user_volume_accumulator(&copier).0;
+    let source_volume = crate::token::accounts::user_volume_address(
+        &source.instruction.program_id,
+        &source.source_wallet,
+    );
+    let copier_volume =
+        crate::token::accounts::user_volume_address(&source.instruction.program_id, &copier);
     let volume_accounts = source
         .wallet_token_accounts
         .iter()
@@ -127,10 +144,17 @@ pub(crate) fn copy_source_instruction(
         if *mint == Pubkey::from_str_const(NATIVE_MINT)
             && trade.intent.input_asset == AssetId::NativeSol
         {
-            instructions.extend(pump_rust_client::token::wrap_sol_instructions(
-                &copier,
-                trade.input_amount,
-            ));
+            let shortfall = trade
+                .input_amount
+                .checked_sub(cached_wsol.min(trade.input_amount))
+                .ok_or_else(|| {
+                    CopyTraderError::Execution("WSOL funding subtraction failed".into())
+                })?;
+            if shortfall > 0 {
+                instructions.extend(pump_rust_client::token::wrap_sol_instructions(
+                    &copier, shortfall,
+                ));
+            }
         }
         let _ = address;
     }
@@ -139,11 +163,6 @@ pub(crate) fn copy_source_instruction(
         accounts,
         data,
     });
-    if trade.intent.input_asset == AssetId::NativeSol
-        || trade.intent.output_asset == AssetId::NativeSol
-    {
-        instructions.push(pump_rust_client::token::unwrap_sol_instruction(&copier));
-    }
     Ok(PreparedRoute {
         dex: DexKind::PumpSwap,
         pool,
@@ -152,6 +171,6 @@ pub(crate) fn copy_source_instruction(
         market_accounts,
         expected_output,
         minimum_output,
-        compute_unit_limit: 350_000,
+        compute_unit_limit: COMPUTE_UNIT_LIMIT,
     })
 }
