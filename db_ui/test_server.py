@@ -46,6 +46,16 @@ class DatabaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.database.browse('copy_attempts',sort='no_such_column')
 
+    def test_transaction_gap_support(self):
+        result = self.database.journal()
+        self.assertIsNone(result['rows'][0][result['columns'].index('transaction_gap')])
+        with sqlite3.connect(self.path) as connection:
+            connection.execute('ALTER TABLE copy_attempts ADD COLUMN transaction_gap INTEGER')
+            connection.execute('UPDATE copy_attempts SET transaction_gap=0')
+        result = self.database.journal()
+        self.assertEqual(result['rows'][0][result['columns'].index('transaction_gap')], 0)
+        self.assertEqual(self.database.trade('abc')['copy']['transaction_gap'], 0)
+
     def test_landing_slot_support(self):
         with sqlite3.connect(self.path) as connection:
             connection.execute('ALTER TABLE copy_attempts ADD COLUMN landed_slot INTEGER')

@@ -4,7 +4,7 @@ use futures_util::{StreamExt, stream};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
-use tokio::{sync::RwLock, time::Instant};
+use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::{
@@ -13,13 +13,11 @@ use crate::{
     token::accounts::associated_token_address,
 };
 
-const MAX_AGE: Duration = Duration::from_secs(1);
 const REFRESH_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy)]
 struct Entry {
     amount: u64,
-    requested_at: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -47,7 +45,7 @@ impl WalletBalanceCache {
     pub async fn get(&self, address: &Pubkey) -> Option<u64> {
         let accounts = self.accounts.read().await;
         let entry = accounts.get(address)?.entry?;
-        (entry.requested_at.elapsed() < MAX_AGE).then_some(entry.amount)
+        Some(entry.amount)
     }
 
     async fn watch(&self, asset: AssetId, owner: Pubkey, address: Pubkey) {
@@ -73,15 +71,12 @@ impl WalletBalanceCache {
         Ok(())
     }
 
-    async fn store(&self, address: Pubkey, amount: u64, requested_at: Instant, revision: u64) {
+    async fn store(&self, address: Pubkey, amount: u64, revision: u64) {
         let mut accounts = self.accounts.write().await;
         if let Some(account) = accounts.get_mut(&address)
             && account.revision == revision
         {
-            account.entry = Some(Entry {
-                amount,
-                requested_at,
-            });
+            account.entry = Some(Entry { amount });
         }
     }
 
@@ -120,7 +115,6 @@ impl WalletBalanceCache {
             })?;
             account.revision
         };
-        let requested_at = Instant::now();
         let amount = if asset == AssetId::NativeSol {
             rpc.get_balance(&owner).await.map_err(|error| {
                 CopyTraderError::Execution(format!("failed to read SOL balance: {error}"))
@@ -144,7 +138,7 @@ impl WalletBalanceCache {
                 }
             }
         };
-        self.store(address, amount, requested_at, revision).await;
+        self.store(address, amount, revision).await;
         Ok(amount)
     }
 
@@ -209,7 +203,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_wsol_keeps_refreshing_and_stale_or_invalidated_entries_are_not_reused() {
+    async fn zero_wsol_keeps_refreshing_and_invalidated_entries_are_not_reused() {
         let owner = Pubkey::new_unique();
         let mint = spl_token::native_mint::id();
         let address = associated_token_address(&owner, &mint, &spl_token::id());
@@ -242,27 +236,12 @@ mod tests {
         cache.refresh(&rpc, owner, &[]).await;
         assert_eq!(cache.get(&address).await, Some(200));
         assert_eq!(server.count("getTokenAccountBalance"), 2);
-        cache
-            .accounts
-            .write()
-            .await
-            .get_mut(&address)
-            .expect("watched")
-            .entry
-            .as_mut()
-            .expect("entry")
-            .requested_at = Instant::now() - Duration::from_secs(2);
-        assert_eq!(cache.get(&address).await, None);
-        cache
-            .fetch(&rpc, AssetId::Token(mint), owner, address)
-            .await
-            .expect("refresh");
         cache.invalidate(&address).await.expect("invalidate");
         assert_eq!(cache.get(&address).await, None);
     }
 
-    #[tokio::test]
-    async fn unlisted_token_is_fetched_on_miss_reused_when_fresh_and_refetched_when_stale() {
+    #[tokio::test(start_paused = true)]
+    async fn cached_balance_survives_age_but_invalidation_refetches() {
         let (asset, owner, address) = token();
         let reads = AtomicUsize::new(0);
         let server = TestRpc::start(move |request| {
@@ -293,22 +272,23 @@ mod tests {
             50
         );
         assert_eq!(server.count("getTokenAccountBalance"), 1);
-        cache
-            .accounts
-            .write()
-            .await
-            .get_mut(&address)
-            .expect("tracked")
-            .entry
-            .as_mut()
-            .expect("entry")
-            .requested_at -= MAX_AGE;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(cache.get(&address).await, Some(50));
+        assert_eq!(
+            cache
+                .get_or_fetch(&rpc, asset, owner, address)
+                .await
+                .expect("old hit"),
+            50
+        );
+        assert_eq!(server.count("getTokenAccountBalance"), 1);
+        cache.invalidate(&address).await.expect("invalidate");
         assert_eq!(cache.get(&address).await, None);
         assert_eq!(
             cache
                 .get_or_fetch(&rpc, asset, owner, address)
                 .await
-                .expect("stale refresh"),
+                .expect("invalidated refresh"),
             100
         );
         assert_eq!(server.count("getTokenAccountBalance"), 2);

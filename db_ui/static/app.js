@@ -11,6 +11,13 @@ function toast(message){$('toast').textContent=message;$('toast').hidden=false;s
 async function api(path,options){const response=await fetch(path,options);const result=await response.json();if(!response.ok)throw new Error(result.error||'Could not load data');return result;}
 function queryString(params){return new URLSearchParams(params).toString();}
 function badge(value){const valid=['landed','failed','unknown','submitting','prepared','skipped','unsupported'];return node('span',value||'—',`badge ${valid.includes(value)?value:''}`);}
+function tradeSide(data){
+  const isSol=asset=>asset==='native_sol'||asset==='So11111111111111111111111111111111111111112';
+  if(!data.input_asset||!data.output_asset)return null;
+  if(isSol(data.input_asset)&&!isSol(data.output_asset))return 'buy';
+  if(!isSol(data.input_asset)&&isSol(data.output_asset))return 'sell';
+  return null;
+}
 function parsed(value){try{return JSON.parse(value||'{}');}catch{return {};}}
 async function loadCatalog(){
   state.catalog=await api('/api/catalog');
@@ -103,7 +110,7 @@ async function loadRows(){
 function renderGrid(result,journal=false){
   if(!result.rows.length){$('grid').replaceChildren(empty('No matching records','Try another filter, search, or query.'));return;}
   const table=node('table');const head=node('thead');const header=node('tr');const body=node('tbody');
-  const columns=journal?['Trade','Status','Target','DEX','Source slot','Copy slot','Slot gap','Route','Received → send','Created']:result.columns;
+  const columns=journal?['Trade','Status','Target','DEX','Source slot','Copy slot','Slot gap','Tx gap','Route','Received → send','Created']:result.columns;
   for(const name of columns){const th=node('th');if(state.view==='table'&&!journal){const button=node('button',name+(state.sort===name?(state.direction==='desc'?' ↓':' ↑'):''));button.onclick=()=>{state.direction=state.sort===name&&state.direction==='desc'?'asc':'desc';state.sort=name;state.offset=0;loadRows();};th.append(button);}else th.textContent=name;header.append(th);}
   head.append(header);table.append(head);
   result.rows.forEach((row,index)=>{
@@ -111,8 +118,8 @@ function renderGrid(result,journal=false){
     const data=Object.fromEntries(result.columns.map((column,i)=>[column,row[i]]));
     if(journal){
       const timing=parsed(data.timings_json);
-      const cells=[compact(data.source_signature),data.status,data.target,data.dex||'—',data.source_slot,data.copy_slot,data.slot_delta,formatMs(data.route_latency_ms),formatMs(timing.receipt_to_send_start_ms),new Date(data.created_at*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})];
-      cells.forEach((value,i)=>{const td=node('td');if(i===1)td.append(badge(value));else if(i===2)td.append(node('span',value,'target'));else {td.textContent=missing(value)?'—':String(value);if([0,4,5,6].includes(i))td.className='mono'+(i===0?' signature':'');if(missing(value))td.classList.add('null');}if(i===0)td.title=data.source_signature;tr.append(td);});
+      const cells=[compact(data.source_signature),data.status,data.target,data.dex||'—',data.source_slot,data.copy_slot,data.slot_delta,data.transaction_gap,formatMs(data.route_latency_ms),formatMs(timing.receipt_to_send_start_ms),new Date(data.created_at*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})];
+      cells.forEach((value,i)=>{const td=node('td');if(i===1)td.append(badge(value));else if(i===2)td.append(node('span',value,'target'));else {td.textContent=missing(value)?'—':String(value);if([0,4,5,6].includes(i))td.className='mono'+(i===0?' signature':'');if(missing(value))td.classList.add('null');}if(i===0){td.title=data.source_signature;const side=tradeSide(data);if(side)td.append(node('span',side==='buy'?'Buy':'Sell',`badge trade-side ${side}`));}tr.append(td);});
       tr.onclick=()=>inspectTrade(data.source_signature);
     }else{
       row.forEach(value=>{const td=node('td',missing(value)?'NULL':String(value).slice(0,180),missing(value)?'null':'mono');td.title=missing(value)?'NULL':String(value).slice(0,500);tr.append(td);});
@@ -134,25 +141,80 @@ function fields(entries){
     else{
       let display=String(value);let isJson=false;try{const object=JSON.parse(display);if(object!==null&&typeof object==='object'){display=JSON.stringify(object,null,2);isJson=true;}}catch{}
       if(display.length>220||isJson){const details=node('details');details.append(node('summary',isJson?'Expand JSON':`Expand value (${number(display.length)} characters)`),node('pre',display));content.append(details);}else content.append(node('span',display));
-      if((name.includes('signature')||name==='pool'||name==='wallet')&&display.length>20){const copy=node('button','Copy','button small');copy.onclick=async()=>{try{await navigator.clipboard.writeText(String(value));toast('Copied to clipboard');}catch{toast('Copy unavailable. Select the value to copy it.');}};content.append(node('br'),copy);}
+      if((name.includes('signature')||name==='pool'||name==='wallet')&&display.length>20){
+        const actions=node('div',undefined,'explorer-actions');
+        for(const [label,base,path] of [
+          ['Orb','https://orbmarkets.io',name.includes('signature')?'tx':'address'],
+          ['Solscan','https://solscan.io',name.includes('signature')?'tx':'account'],
+        ]){
+          const link=node('a',`Open in ${label} ↗`,'button small');
+          link.href=`${base}/${path}/${encodeURIComponent(String(value))}`;
+          link.target='_blank';link.rel='noopener noreferrer';actions.append(link);
+        }
+        content.append(actions);
+      }
     }field.append(content);section.append(field);
   }return section;
 }
 function section(title,content){const element=node('section',undefined,'detail-section');element.append(node('h3',title),content);return element;}
 function openInspector(title,eyebrow){$('detail-title').textContent=title;$('detail-eyebrow').textContent=eyebrow;$('detail-body').replaceChildren();if(!$('detail').open)$('detail').showModal();}
 function inspectRow(columns,row){openInspector(state.view==='table'?state.table:'Query result','Record inspector');$('detail-body').append(fields(columns.map((name,index)=>[name,row[index]])));}
+function renderTimings(timing){
+  const container=node('div');
+  container.append(node('p','Receipt → send is the submission latency. Stage durations overlap; checkpoints are elapsed since receipt, so do not add them together.','muted'));
+  const tablist=node('div',undefined,'timing-tabs');tablist.setAttribute('role','tablist');tablist.setAttribute('aria-label','Execution timing categories');
+  const panels=new Map();const tabs=[];
+  function selectTimingTab(index){tabs.forEach((tab,i)=>{const selected=i===index;tab.button.setAttribute('aria-selected',String(selected));tab.button.tabIndex=selected?0:-1;tab.panel.hidden=!selected;});}
+  for(const [index,label] of ['Hot path','After send','Checkpoints','Background','Context'].entries()){
+    const button=node('button',label,'timing-tab');button.type='button';button.id=`timing-tab-${index}`;button.setAttribute('role','tab');button.setAttribute('aria-controls',`timing-panel-${index}`);
+    const panel=node('div',undefined,'timing-panel');panel.id=`timing-panel-${index}`;panel.setAttribute('role','tabpanel');panel.setAttribute('aria-labelledby',button.id);panel.tabIndex=0;
+    button.onclick=()=>selectTimingTab(index);
+    button.onkeydown=event=>{let next=index;if(event.key==='ArrowRight')next=(index+1)%tabs.length;else if(event.key==='ArrowLeft')next=(index+tabs.length-1)%tabs.length;else if(event.key==='Home')next=0;else if(event.key==='End')next=tabs.length-1;else return;event.preventDefault();selectTimingTab(next);tabs[next].button.focus();};
+    tabs.push({button,panel});panels.set(label,panel);tablist.append(button);
+  }
+  container.append(tablist,...tabs.map(tab=>tab.panel));selectTimingTab(0);
+  function addTimingSection(title,content){const category=title.startsWith('Copy worker · after')?'After send':title.startsWith('Checkpoints')?'Checkpoints':title.startsWith('Background')||title.startsWith('Database')?'Background':title.startsWith('Trade context')||title.startsWith('Other')?'Context':'Hot path';panels.get(category).append(section(title,content));}
+  const groups=[
+    ['Submission latency','Total elapsed time before the sender request starts.',['receipt_to_send_start_us','receipt_to_send_start_ms']],
+    ['Ingestion task & execution queue','Stream payload decoding and journal enqueueing run on ingestion. Queue wait delays the serial copy worker.',['payload_decode_us','observation_enqueue_us','queue_wait_us','ingress_to_worker_us','ingestion_queue_ms']],
+    ['Copy worker · before send','Work and awaited reads on the submission path. DB enqueueing is included in stages; background commits are not.',['pre_decode_checks_us','decode_us','preparation_ms','pre_route_preparation_us','mint_read_ms','cache_lookup_ms','discovery_ms','route_wall_us','route_wall_ms','route_ms','route_shared_preparation_us','route_shared_preparation_ms','route_source_pool_fetch_ms','source_route_ms','route_instruction_build_us','route_instruction_build_ms','post_route_ms','post_route_preparation_us','transaction_build_us','transaction_build_ms','transaction_sign_us','transaction_sign_ms','serialization_us','cache_invalidation_us','db_pre_send_us']],
+    ['Submission & background settlement','The worker awaits the Sender response and journal enqueueing. Confirmation and reconciliation then run per copy in background tasks while the next trade is prepared.',['sender_request_us','sender_request_ms','receipt_to_send_response_ms','post_send_journal_ms','confirmation_ms','reconciliation_ms','reconciliation_metadata_ms','db_post_send_us']],
+    ['Checkpoints · elapsed since receipt','Cumulative timestamps, not individual stage durations.',['decode_complete_ms','source_pool_identified_ms','cache_lookup_complete_ms','quote_complete_ms','checks_complete_ms','transaction_built_ms','transaction_signed_ms','sender_request_started_ms','sender_response_received_ms']],
+    ['Trade context','Values below are counts or amounts, not durations.',['slot_delta','mint_from_source','cached_wsol_lamports','wrap_lamports']],
+  ];
+  const seen=new Set();
+  function rows(keys){const list=node('div');for(const key of keys){const value=timing[key];if(typeof value!=='number')continue;seen.add(key);if(key.endsWith('_ms')&&typeof timing[key.replace(/_ms$/,'_us')]==='number')continue;const row=node('div',undefined,'timing-row');const text=key==='mint_from_source'?(value?'Yes':'No'):key==='slot_delta'?`${number(value)} slots`:key.endsWith('_lamports')?`${number(value)} lamports`:key.endsWith('_us')?`${number(value)} µs`:key.endsWith('_ms')?formatMs(value):number(value);row.append(node('span',key.replace(/_/g,' ')),node('strong',text));list.append(row);}return list;}
+  for(const [title,note,keys] of groups){const list=rows(keys);if(!list.childElementCount)continue;const content=node('div');content.append(node('p',note,'muted'),list);addTimingSection(title,content);}
+  const background=node('div');
+  background.append(node('p','These run independently. Per-trade worker durations are not recorded.','muted'));
+  background.append(fields([
+    ['Journal writer','SQLite observation, intent and transaction commits.'],
+    ['Timing writer','Batched timing persistence after trade processing.'],
+    ['Logging thread','Terminal output; formatting and enqueueing still happen on the calling task.'],
+    ['Cache refresh tasks','Mint validation, balances and blockhash refresh. A foreground cache miss can still require an awaited read.'],
+  ]));
+  addTimingSection('Background workers · unmeasured',background);
+  const db=node('div');
+  if(typeof timing.db_total_us==='number'){seen.add('db_total_us');db.append(node('p',`Tracked database operations: ${number(timing.db_total_us)} µs. This is not a measurement of background commit time.`,'muted'));}
+  for(const [operation,value] of Object.entries(timing.database||{})){const row=node('div',undefined,'timing-row');row.append(node('span',`DB · ${operation}`),node('strong',`${number(value.elapsed_us)} µs / ${value.calls} calls`));db.append(row);}
+  if(db.childElementCount)addTimingSection('Database instrumentation',db);
+  const extra=rows(Object.keys(timing).filter(key=>!seen.has(key)));
+  if(extra.childElementCount)addTimingSection('Other recorded metrics · unclassified',extra);
+  for(const {panel} of tabs)if(!panel.childElementCount)panel.append(node('p','No metrics recorded for this category.','muted'));
+  return section('Execution timings',container);
+}
 async function inspectTrade(signature){
   openInspector('Trade details',compact(signature));$('detail-body').append(node('p','Loading…','muted'));
   try{
     const result=await api('/api/trade?'+queryString({signature}));$('detail-body').replaceChildren();
     const unsupported=parsed(result.source.skip_reason);
     if(result.source.status==='unsupported') $('detail-body').append(section('Unsupported',fields([['Reason',unsupported.message||result.source.skip_reason],['Code',unsupported.code||'unsupported']])));
+    if(result.copy)$('detail-body').append(section('Transaction gap',fields([
+      ['Transactions between source and copy',missing(result.copy.transaction_gap)?'Pending or unavailable':`${number(result.copy.transaction_gap)} transactions`],
+      ['Ordering','Finalized block order; excludes source and copy, includes votes and failed transactions']
+    ])));
     const timing=parsed(result.source.timings_json);
-    if(Object.keys(timing).length){
-      const list=node('div');for(const [key,value] of Object.entries(timing)){if(typeof value!=='number')continue;const row=node('div',undefined,'timing-row');row.append(node('span',key.replace(/_/g,' ')),node('strong',key==='mint_from_source'?(value?'Yes':'No'):key.endsWith('_us')?`${number(value)} µs`:formatMs(value)));list.append(row);}
-      if(timing.database){for(const [operation,value] of Object.entries(timing.database)){const row=node('div',undefined,'timing-row');row.append(node('span',`DB · ${operation}`),node('strong',`${number(value.elapsed_us)} µs / ${value.calls} call${value.calls===1?'':'s'}`));list.append(row);}}
-      $('detail-body').append(section('Execution timings',list));
-    }
+    if(Object.keys(timing).length)$('detail-body').append(renderTimings(timing));
     if(result.copy)$('detail-body').append(section('Copy transaction',fields(Object.entries(result.copy))));
     $('detail-body').append(section('Source transaction',fields(Object.entries(result.source))));
   }catch(cause){$('detail-body').replaceChildren(node('p',cause.message,'error'));}

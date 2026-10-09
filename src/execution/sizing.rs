@@ -71,11 +71,9 @@ impl<'a> SizingPolicy<'a> {
         };
         let minimum = decimal_to_atomic(&rule.minimum_input, decimals)?;
         let maximum = decimal_to_atomic(&rule.maximum_input, decimals)?;
+        let input_amount = input_amount.min(maximum);
         if input_amount < minimum {
             return Ok(Err(SkipReason::BelowMinimum));
-        }
-        if input_amount > maximum {
-            return Ok(Err(SkipReason::AboveMaximum));
         }
         Ok(Ok(SizedTrade {
             intent,
@@ -118,7 +116,31 @@ mod tests {
         assert_eq!(sized.as_ref().map(|value| value.input_amount), Some(10_000));
     }
     #[test]
-    fn absolute_sizing_keeps_input_limits() {
+    fn fixed_sizing_clamps_and_preserves_smaller_inputs() {
+        let rule = TokenRule {
+            mint: Pubkey::new_unique(),
+            minimum_input: "0.001".into(),
+            maximum_input: "0.1".into(),
+        };
+        for (amount, expected) in [
+            ("0.05", 50_000_000),
+            ("0.1", 100_000_000),
+            ("0.2", 100_000_000),
+        ] {
+            let config = SizingConfig::Fixed {
+                amount: amount.into(),
+            };
+            let mut buy = intent(1_000_000_000);
+            buy.input_asset = AssetId::NativeSol;
+            let sized = SizingPolicy::new(&config)
+                .size_trade(buy, &rule, 9)
+                .expect("sizing")
+                .expect("buy");
+            assert_eq!(sized.input_amount, expected);
+        }
+    }
+    #[test]
+    fn absolute_sizing_clamps_to_input_limits() {
         let config = SizingConfig::Percent { percent_bps: 10000 };
         let policy = SizingPolicy::new(&config);
         let rule = TokenRule {
@@ -128,16 +150,22 @@ mod tests {
         };
         let mut buy = intent(100_000_001);
         buy.input_asset = AssetId::NativeSol;
-        assert!(matches!(
-            policy.size_trade(buy, &rule, 9).expect("sizing"),
-            Err(SkipReason::AboveMaximum)
-        ));
-        assert!(matches!(
+        assert_eq!(
+            policy
+                .size_trade(buy, &rule, 9)
+                .expect("sizing")
+                .expect("capped buy")
+                .input_amount,
+            100_000_000
+        );
+        assert_eq!(
             policy
                 .size_trade(intent(100_001), &rule, 6)
-                .expect("sizing"),
-            Err(SkipReason::AboveMaximum)
-        ));
+                .expect("sizing")
+                .expect("capped token trade")
+                .input_amount,
+            100_000
+        );
         let mut dust = intent(999);
         dust.output_asset = AssetId::NativeSol;
         assert!(matches!(

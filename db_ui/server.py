@@ -100,6 +100,9 @@ class Database:
             sources = {c["name"] for c in self.columns(connection, "source_transactions")}
             slot = "a.landed_slot" if "landed_slot" in copies else "NULL"
             timings = "s.timings_json" if "timings_json" in sources else "NULL"
+            input_asset = "s.input_asset" if "input_asset" in sources else "NULL"
+            output_asset = "s.output_asset" if "output_asset" in sources else "NULL"
+            gap = "a.transaction_gap" if "transaction_gap" in copies else "NULL"
             source_status = "s.status" if "status" in sources else "'observed_live'"
             outcome = f"COALESCE(a.status, {source_status})"
             filters, parameters = [], []
@@ -118,7 +121,7 @@ class Database:
             sql = f"""SELECT a.id, s.signature AS source_signature, {outcome} AS status, COALESCE(a.execution_target, 'mainnet') AS target,
                 s.dex, s.slot AS source_slot, {slot} AS copy_slot,
                 CASE WHEN a.execution_target='mainnet' THEN {slot}-s.slot ELSE NULL END AS slot_delta,
-                a.route_latency_ms, COALESCE(a.created_at, s.observed_at) AS created_at, a.local_signature, {timings} AS timings_json
+                {gap} AS transaction_gap, a.route_latency_ms, COALESCE(a.created_at, s.observed_at) AS created_at, a.local_signature, {timings} AS timings_json, {input_asset} AS input_asset, {output_asset} AS output_asset
                 {source}{where} ORDER BY COALESCE(a.created_at, s.observed_at) DESC,s.signature DESC LIMIT ? OFFSET ?"""
             return {**self.result(connection.execute(sql, parameters + [limit, offset]), limit),
                     "total": count, "offset": offset, "has_landed_slots": "landed_slot" in copies}

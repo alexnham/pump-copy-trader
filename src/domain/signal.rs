@@ -6,6 +6,7 @@ use solana_sdk::{signature::Signature, transaction::VersionedTransaction};
 #[serde(rename_all = "snake_case")]
 pub enum SignalOrigin {
     Live,
+    Preconfirmation,
     Recovery,
 }
 
@@ -13,6 +14,7 @@ impl SignalOrigin {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Live => "live",
+            Self::Preconfirmation => "preconfirmation",
             Self::Recovery => "recovery",
         }
     }
@@ -24,6 +26,8 @@ pub struct ObservedTransaction {
     pub slot: u64,
     pub block_time: Option<i64>,
     pub origin: SignalOrigin,
+    // Read-only source view: v1 inline accounts are normalized to Legacy.
+    // Never serialize or verify this view as the original signed transaction.
     pub transaction: VersionedTransaction,
     pub meta: TransactionMeta,
     pub raw_payload: String,
@@ -38,6 +42,8 @@ pub struct TransactionMeta {
         Option<Vec<solana_sdk::message::compiled_instruction::CompiledInstruction>>,
     #[serde(skip)]
     pub live_loaded_addresses: Option<Vec<solana_sdk::pubkey::Pubkey>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_v1_config: Option<SourceV1Config>,
     pub err: Option<Value>,
     #[serde(default)]
     pub inner_instructions: Option<Vec<UiInnerInstructions>>,
@@ -100,4 +106,13 @@ pub struct UiTokenBalance {
 pub struct UiTokenAmount {
     pub amount: String,
     pub decimals: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceV1Config {
+    pub priority_fee: Option<u64>,
+    pub compute_unit_limit: Option<u32>,
+    pub loaded_accounts_data_size_limit: Option<u32>,
+    pub heap_size: Option<u32>,
 }

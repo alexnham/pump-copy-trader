@@ -19,6 +19,8 @@ pub struct Cli {
 pub enum Command {
     /// Run the live signal and execution pipeline.
     Run,
+    /// Enrich completed copies in a separate process without starting trading.
+    TransactionGaps,
     /// Validate configuration and external dependencies without trading.
     Doctor,
     /// Report receipt-to-send latency percentiles from recent attempted copies.

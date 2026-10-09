@@ -15,9 +15,18 @@ use solana_sdk::pubkey::Pubkey;
 
 #[test]
 fn pump_swap_source_copy_rewrites_wallet_accounts_and_amounts() {
-    for discriminator in [
-        [102, 6, 61, 18, 1, 218, 235, 234],
-        [198, 46, 21, 82, 180, 217, 232, 112],
+    for (discriminator, first, second) in [
+        ([102, 6, 61, 18, 1, 218, 235, 234], 475_169_716, 1_010_000),
+        (
+            [198, 46, 21, 82, 180, 217, 232, 112],
+            1_010_000,
+            475_169_716,
+        ),
+        (
+            [51, 230, 133, 164, 1, 127, 131, 173],
+            1_010_000,
+            475_169_716,
+        ),
     ] {
         let source_wallet = Pubkey::new_unique();
         let copier = Pubkey::new_unique();
@@ -63,9 +72,10 @@ fn pump_swap_source_copy_rewrites_wallet_accounts_and_amounts() {
                 source_input_amount: 200,
                 source_output_amount: 100,
             },
-            input_amount: 77,
+            input_amount: 1_010_000,
         };
-        let route = copy_source_instruction(&instruction, &trade, copier, 31, 29).unwrap();
+        let route = copy_source_instruction(&instruction, &trade, copier, 950_339_433, 475_169_716)
+            .unwrap();
         let copied = route
             .instructions
             .iter()
@@ -82,11 +92,11 @@ fn pump_swap_source_copy_rewrites_wallet_accounts_and_amounts() {
         assert_eq!(copied.accounts[3].pubkey, copier);
         assert_eq!(
             u64::from_le_bytes(copied.data[8..16].try_into().unwrap()),
-            29
+            first
         );
         assert_eq!(
             u64::from_le_bytes(copied.data[16..24].try_into().unwrap()),
-            77
+            second
         );
     }
 }
@@ -308,6 +318,7 @@ async fn source_build_keeps_wsol_open_without_account_reads() {
         let client = Arc::new(MainnetClient::new(
             server.url.clone(),
             &MainnetConfig {
+                fanout: Default::default(),
                 source_direct: true,
                 fixed_priority_fee_micro_lamports: Some(100),
                 sender_url: server.url.clone(),

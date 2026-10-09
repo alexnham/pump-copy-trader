@@ -27,6 +27,79 @@ pub struct Store {
 }
 
 impl Store {
+    pub async fn nonce_was_used(&self, account: &str, nonce: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM nonce_uses WHERE account=? AND nonce=?",
+        )
+        .bind(account)
+        .bind(nonce)
+        .fetch_one(&self.pool)
+        .await?
+            > 0)
+    }
+
+    /// Wait for earlier observation/admission writes before committing fan-out.
+    pub async fn persist_fanout(
+        &self,
+        source: &str,
+        account: &str,
+        nonce: &str,
+        variants: &[(String, Vec<u8>, String)],
+        simulation: &str,
+    ) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            journal.enqueue(Box::pin(async move {
+                let _ = tx.send(());
+                Ok(())
+            }))?;
+            rx.await
+                .map_err(|_| CopyTraderError::Storage("journal barrier failed".into()))?;
+        }
+        let first = variants
+            .first()
+            .ok_or_else(|| CopyTraderError::Storage("empty fanout".into()))?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO nonce_uses(account,nonce,source_signature) VALUES(?,?,?)")
+            .bind(account)
+            .bind(nonce)
+            .bind(source)
+            .execute(&mut *tx)
+            .await?;
+        for (signature, bytes, route) in variants {
+            sqlx::query("INSERT INTO copy_variants(source_signature,local_signature,signed_transaction,route_name) VALUES(?,?,?,?) ON CONFLICT(source_signature,local_signature) DO NOTHING")
+                .bind(source).bind(signature).bind(bytes).bind(route).execute(&mut *tx).await?;
+        }
+        let updated = sqlx::query("UPDATE copy_attempts SET local_signature=?,signed_transaction=?,simulation_json=?,status='submitting',updated_at=unixepoch() WHERE source_signature=? AND status='prepared'")
+            .bind(&first.0).bind(&first.1).bind(simulation).bind(source).execute(&mut *tx).await?;
+        if updated.rows_affected() != 1 {
+            return Err(CopyTraderError::Storage(
+                "fanout attempt was not prepared".into(),
+            ));
+        }
+        tx.commit().await?;
+        if let Some(journal) = &self.journal {
+            journal.submitted(source)?;
+        }
+        Ok(())
+    }
+
+    pub async fn variant_signatures(&self, source: &str) -> Result<Vec<String>> {
+        Ok(
+            sqlx::query_scalar(
+                "SELECT local_signature FROM copy_variants WHERE source_signature=?",
+            )
+            .bind(source)
+            .fetch_all(&self.pool)
+            .await?,
+        )
+    }
+    pub async fn select_variant(&self, source: &str, signature: &str) -> Result<()> {
+        sqlx::query("UPDATE copy_attempts SET local_signature=?, signed_transaction=(SELECT signed_transaction FROM copy_variants WHERE source_signature=? AND local_signature=?) WHERE source_signature=? AND EXISTS(SELECT 1 FROM copy_variants WHERE source_signature=? AND local_signature=?)")
+            .bind(signature).bind(source).bind(signature).bind(source).bind(source).bind(signature).execute(&self.pool).await?;
+        Ok(())
+    }
+
     fn persistence_store(&self) -> Self {
         Self {
             pool: self.pool.clone(),
@@ -50,6 +123,23 @@ impl Store {
         let mut store = self.clone();
         store.journal = Some(journal);
         Ok((store, writer))
+    }
+
+    pub(super) async fn pending_transaction_gaps(
+        &self,
+    ) -> Result<Vec<super::transaction_gap::GapAttempt>> {
+        Ok(sqlx::query_as("SELECT a.id, a.source_signature, a.local_signature, s.slot AS source_slot, a.landed_slot FROM copy_attempts a JOIN source_transactions s ON s.signature=a.source_signature WHERE a.execution_target='mainnet' AND a.landed_slot IS NOT NULL AND a.local_signature IS NOT NULL AND a.transaction_gap IS NULL AND (a.gap_checked_at IS NULL OR a.gap_checked_at < unixepoch()-300) ORDER BY a.gap_checked_at IS NOT NULL, a.id DESC LIMIT 4")
+            .fetch_all(&self.pool).await?)
+    }
+
+    pub(super) async fn record_transaction_gap(
+        &self,
+        row: &super::transaction_gap::GapAttempt,
+        gap: Option<i64>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE copy_attempts SET transaction_gap=?, gap_checked_at=unixepoch() WHERE id=? AND local_signature=? AND landed_slot=? AND transaction_gap IS NULL")
+            .bind(gap).bind(row.id).bind(&row.local_signature).bind(row.landed_slot).execute(&self.pool).await?;
+        Ok(())
     }
 
     pub async fn record_observation(&self, observed: &ObservedTransaction) -> Result<bool> {
@@ -333,7 +423,7 @@ impl Store {
         let slot = i64::try_from(observed.slot)
             .map_err(|_| CopyTraderError::Storage("slot exceeds SQLite INTEGER".to_owned()))?;
         let status = match observed.origin {
-            SignalOrigin::Live => AttemptStatus::ObservedLive,
+            SignalOrigin::Live | SignalOrigin::Preconfirmation => AttemptStatus::ObservedLive,
             SignalOrigin::Recovery => AttemptStatus::MissedOffline,
         };
         let result = sqlx::query(
@@ -342,12 +432,14 @@ impl Store {
                 (signature, slot, block_time, origin, status, raw_payload, observed_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(signature) DO UPDATE SET
+                slot = CASE WHEN excluded.origin = 'live' THEN excluded.slot ELSE source_transactions.slot END,
+                block_time = COALESCE(excluded.block_time, source_transactions.block_time),
                 origin = CASE
                     WHEN excluded.origin = 'live' THEN 'live'
                     ELSE source_transactions.origin
                 END,
                 status = CASE
-                    WHEN excluded.origin = 'live' AND source_transactions.status = 'missed_offline'
+                    WHEN excluded.origin IN ('live', 'preconfirmation') AND source_transactions.status = 'missed_offline'
                         THEN 'observed_live'
                     ELSE source_transactions.status
                 END,
@@ -1036,5 +1128,61 @@ mod background_tests {
         );
         drop(restarted);
         writer.wait().await.expect("drain");
+    }
+}
+
+#[cfg(test)]
+mod fanout_tests {
+    use super::*;
+    #[tokio::test]
+    async fn fanout_commit_is_atomic_and_nonce_reuse_is_rejected() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let (journal, mut writer) = store.background_journal().await.unwrap();
+        journal
+            .record_recovered_signature("first", 42)
+            .await
+            .unwrap();
+        journal
+            .reserve_attempt("first", ExecutionTarget::Mainnet, 10, 9)
+            .await
+            .unwrap();
+        let variants = vec![
+            ("a".into(), vec![1], "route-a".into()),
+            ("b".into(), vec![2], "route-b".into()),
+            ("a".into(), vec![1], "same-wire-other-route".into()),
+        ];
+        journal
+            .persist_fanout("first", "account", "nonce", &variants, "{}")
+            .await
+            .unwrap();
+        assert!(store.nonce_was_used("account", "nonce").await.unwrap());
+        assert_eq!(store.variant_signatures("first").await.unwrap().len(), 2);
+        store.select_variant("first", "b").await.unwrap();
+        let row: (String, Vec<u8>) = sqlx::query_as("SELECT local_signature,signed_transaction FROM copy_attempts WHERE source_signature='first'").fetch_one(&store.pool).await.unwrap();
+        assert_eq!(row, ("b".into(), vec![2]));
+        store
+            .record_recovered_signature("second", 43)
+            .await
+            .unwrap();
+        store
+            .reserve_attempt("second", ExecutionTarget::Mainnet, 10, 9)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .persist_fanout("second", "account", "nonce", &variants, "{}")
+                .await
+                .is_err()
+        );
+        assert!(store.variant_signatures("second").await.unwrap().is_empty());
+        assert!(
+            store
+                .persist_fanout("missing", "account", "fresh", &variants, "{}")
+                .await
+                .is_err()
+        );
+        assert!(!store.nonce_was_used("account", "fresh").await.unwrap());
+        drop(journal);
+        writer.wait().await.unwrap();
     }
 }

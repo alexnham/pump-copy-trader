@@ -7,6 +7,11 @@ http_url = "https://mainnet.helius-rpc.com/"
 commitment = "processed"
 queue_capacity = 256
 
+[signal.preconfirmations]
+# Successful direct buys trigger early; LaserStream remains the fallback.
+enabled = true
+websocket_url = "wss://beta.helius-rpc.com/"
+
 [routing]
 timeout_ms = 2000
 
@@ -25,6 +30,29 @@ sender_url = "https://sender.helius-rpc.com/fast?swqos_only=true"
 tip_lamports = 5000
 priority_level = "high"
 max_priority_fee_micro_lamports = 5000000
+
+# Opt-in durable nonce fan-out. Pre-create nonce accounts with the copier
+# wallet as authority; reserve one account per simultaneous trade.
+[mainnet.fanout]
+enabled = false
+nonce_accounts = []
+submit_timeout_ms = 1500
+routes = []
+
+# To configure routes, remove `routes = []` above and add one or more:
+# [[mainnet.fanout.routes]]
+# name = "helius-ewr"
+# url = "http://ewr-sender.helius-rpc.com/fast?swqos_only=true"
+# tip_account = "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE"
+# tip_lamports = 5000
+# priority_fee_micro_lamports = 100000
+#
+# [[mainnet.fanout.routes]]
+# name = "helius-global"
+# url = "https://sender.helius-rpc.com/fast?swqos_only=true"
+# tip_account = "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ"
+# tip_lamports = 5000
+# priority_fee_micro_lamports = 150000
 
 [storage]
 database_url = "sqlite://copy_trader.sqlite?mode=rwc"
@@ -49,10 +77,10 @@ mode = "allowlist"
 # [token_policy]
 # mode = "all"
 # minimum_input = "0.001"
-# maximum_input = "0.1"
+# maximum_input = "0.05" # Larger sized copies are capped at this amount.
 # Listed token rules remain optional overrides in all-token mode.
 
 [[tokens]]
 mint = "So11111111111111111111111111111111111111112"
 minimum_input = "0.001"
-maximum_input = "0.1"
+maximum_input = "0.05" # Larger sized copies are capped at this amount.

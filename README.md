@@ -7,6 +7,8 @@ database UI. Execution is mainnet only.
 
 ## Setup
 
+Building requires Rust 1.98.1 or newer for the transaction wire decoder.
+
 1. Copy `config.example.toml` to `config.toml` and set the source wallet, nearest
    LaserStream region, token policy, sizing limits, and slippage.
 2. Copy `.env.example` to `.env`. Set `HELIUS_API_KEY` and an absolute
@@ -25,6 +27,34 @@ cargo run -- --config config.toml run
 `doctor` checks connectivity and balances without submitting a transaction.
 `status` opens and migrates SQLite without requiring a signer or network access.
 `COPY_TRADER_CONFIG` remains an alternative to `--config`.
+
+`[signal.preconfirmations]` is enabled by default and subscribes to Helius
+`preconfSubscribe` at `wss://beta.helius-rpc.com/`, using `HELIUS_API_KEY`. Set
+`enabled = false` to use LaserStream alone. `doctor` checks the subscription when
+enabled. The feed filters for the source wallet and successful leader executions;
+BAM and unknown-status signals are excluded. Reconnects use bounded backoff while
+LaserStream continues at `signal.commitment`.
+
+Early execution supports a single direct Pump.fun or PumpSwap buy with canonical
+wallet token accounts and SOL/WSOL quote. Buy amounts come from instruction limits:
+exact-input buys use the specified input and minimum output; exact-output buys use
+the maximum input and requested output. Percentage sizing therefore uses the
+source's input budget for exact-output buys, rather than its eventual actual spend.
+Zero output limits, routed/CPI trades, noncanonical accounts, and sells defer to
+LaserStream. Sells retain position-relative sizing from processed pre-sell balances.
+Legacy, v0, and v1 wire transactions are decoded; v0 lookup mappings are learned
+from LaserStream metadata and an unknown mapping defers to the processed feed.
+Mint safety checks, funding limits, copy confirmation, and settlement remain active.
+
+Signatures are deduplicated in the worker and reserved through the shared journal
+before submission. Preparation failures before reservation remain eligible for
+processed fallback. Preconfirmation observations are journaled with their origin;
+the later LaserStream observation supplies the processed slot without submitting
+another copy. Timing records include `preconfirmation = 1` for early signals.
+A successful leader execution is provisional and may not land on the canonical
+chain; a copy can execute even if its source later drops. Preconfirmations require
+an eligible Helius plan and coverage varies by leader. See the
+[subscription reference](https://www.helius.dev/docs/pre-confirmations/preconf-subscribe).
 
 The local extraction preserves your ignored `.env` and trading configuration,
 including the live gate, and points to the existing keypair. It starts with a
@@ -89,7 +119,7 @@ buys may spend less than the configured input amount. Exact-input buys and sells
 use the slippage-adjusted output as their minimum received amount.
 
 Native PumpSwap copies keep the copier's canonical WSOL account open. Buys use
-fresh cached WSOL first and wrap only the shortfall; a missing or stale WSOL
+cached WSOL first and wrap only the shortfall; a missing or invalidated WSOL
 cache falls back to wrapping the full input without another pre-send RPC read.
 The WSOL cache is warmed at startup, refreshed in the background even when zero,
 and invalidated on submission. Confirmed PumpSwap copies refresh the WSOL
@@ -133,9 +163,10 @@ in flight. SOL and token accounts with positive or uninitialized balances are
 refreshed; newly encountered token accounts join this set automatically. Zero
 balances remain cached but are not polled while idle.
 
-Balance entries expire one second after request start. A cache miss or stale
-entry triggers a targeted RPC balance read for that account, including mints
-absent from configuration. A missing token account is cached as zero only after
+Balance entries do not expire with age: execution reuses the last cached value,
+assuming this pipeline is the only writer to wallet balances. A missing or
+invalidated entry triggers a targeted RPC balance read for that account, including
+mints absent from configuration. A missing token account is cached as zero only after
 RPC confirms its absence; transport failures and invalid balances remain errors.
 Submission and confirmation invalidate the affected token balances and SOL.
 Post-confirmation input/output reads immediately update the cache, and token-to-token
@@ -155,8 +186,18 @@ Balance caches can lag the chain; source-price estimates can
 be inaccurate after pool movement. Slippage limits are checked by the on-chain
 instruction.
 
-Copies remain sequential through confirmation and reconciliation. Disconnect
-recovery journals missed signatures as `missed_offline` without executing them.
+Preparation and submission stay ordered. After a Sender acknowledgment, each copy
+confirms and reconciles in a background task while the worker takes the next signal.
+At most 64 settlement tasks run at once. Per-account reservations prevent pending
+copies from reusing input funds, including WSOL, tips, worst-case priority fees,
+and a conservative 0.01 SOL allowance per copy for account rent and base fees.
+Tracked input accounts reuse this conservative balance budget during an overlapping
+batch, avoiding another pre-send balance RPC after each submission. RPC refreshes
+do not credit the budget while copies are pending. Reservations remain deducted
+for the entire overlapping batch, then affected cache entries are invalidated before fresh balances can be used. Ambiguous sends
+and confirmation timeouts retain their budgets until restart recovery.
+Graceful shutdown drains queued observations and settlement tasks before the journal.
+Disconnect recovery journals missed signatures as `missed_offline` without executing them.
 Only live stream updates can execute. Processed source observations can still be
 removed by a fork.
 
@@ -283,6 +324,114 @@ fraction of measured submissions below 1,000 µs. Missing measurements are exclu
 zero is a valid measurement. The limit selects recent source records, including
 skips and failures, so the measured sample count may be smaller. Sender response
 latency is reported separately from receipt-to-send. Existing records are retained,
-so use a recent window to compare after restart. Cache-miss RPC reads and the serial
-worker's confirmation/reconciliation can still increase latency during bursts.
+so use a recent window to compare after restart. Cache-miss RPC reads and the ordered
+worker's Sender requests can still increase latency during bursts. Background
+settlement can delay new submissions only at the 64-task limit or when reserved
+funds exhaust the available budget.
 These optimizations alone do not establish a live sub-1 ms p95 guarantee.
+
+Trade input limits stay under `[[tokens]]`. `maximum_input` caps percentage or
+fixed input sizing instead of skipping an oversized copy. For SOL,
+`maximum_input = "0.05"` caps swap input at 0.05 SOL; fees, tips, and account rent
+are additional. Inputs below `minimum_input` are skipped. Token-to-SOL exits
+continue to mirror the source sold fraction of the copier position. Config
+changes take effect after restarting the trader.
+
+### Source transaction v1 support
+
+Live LaserStream ingestion accepts legacy, v0, and v1 sources. V1 config presence
+identifies the format; inline keys, instruction bytes, and signer/writable flags
+are normalized into the existing read-only source view without base58 conversions
+or added RPC calls. The source budget config is retained as `sourceV1Config` in
+metadata. This view is not the original signed wire message and must never be
+serialized, signature-verified, or submitted as that source transaction.
+V1 lookup tables, loaded addresses, invalid headers/indexes, and oversized account
+or instruction counts are rejected. Copies still use the existing legacy builder
+with local compute budget and fee settings; source v1 budgets are not copied.
+Reconciliation opts into RPC transaction version 1. Reconnect recovery remains a
+signature audit, not replay of missed transactions.
+
+Run `cargo test --release benchmark_v1_source_decode -- --ignored --nocapture`
+for a 64-account/64-instruction source conversion benchmark. This excludes stream
+protobuf parsing, queueing, and trade execution; live receipt-to-send percentiles
+must be measured separately and are not guaranteed below 1 ms.
+
+PumpSwap copies encode `buy` as base output followed by maximum quote input,
+`buy_exact_quote_in` as quote input followed by minimum base output, and `sell`
+as base input followed by minimum quote output. These layouts are checked against
+the PumpSwap IDL and covered by amount-order regression tests.
+
+## Transaction gap
+
+Trade details show **Transaction gap**, the number of transactions strictly
+between the source and copy in finalized block order, including votes and failed
+transactions. The journal also shows **Tx gap**. Adjacent transactions count as
+zero; unavailable data stays blank.
+
+Run `cargo run --release -- transaction-gaps` as a separate process to enrich
+new and historical copies. It polls four attempts every 30 seconds, uses its own
+runtime and HTTP pool, and does not start trading or require a signer. Lookups
+use signature-only blocks, retry after five minutes, and are capped at 512 slots
+and 60 seconds per attempt. SQLite and RPC quota remain shared resources.
+
+### Durable nonce fan-out (opt-in)
+
+Set `mainnet.fanout.enabled = true`, list initialized nonce account public keys
+in `nonce_accounts`, and configure 1–8 `[[mainnet.fanout.routes]]` entries.
+Both config files include disabled examples. Each route requires a unique `name`,
+HTTP(S) `url`, `tip_account`, `tip_lamports`, and
+`priority_fee_micro_lamports` (bounded by the existing maximum).
+`submit_timeout_ms` bounds each concurrent submission (default 1500).
+When enabled these routes replace the single Sender submission; the existing
+Sender settings remain the default when disabled.
+
+Routes must accept standard JSON-RPC `sendTransaction` with a base64 legacy
+transaction, `skipPreflight=true`, and `maxRetries=0`. Bundle APIs and direct TPU
+transport and address lookup tables are not implemented. Fan-out rejects any
+variant exceeding Solana’s 1232-byte packet limit; larger PumpSwap routes may
+require a future versioned-transaction implementation. Supply each provider's required tip account and
+minimum fee/tip. Recognized Helius Sender URLs automatically receive
+`HELIUS_API_KEY` from the environment / `.env` at startup, including the single
+Sender URL and fan-out routes. Omit `api-key` from those URLs; empty keys and
+`YOUR_API_KEY` / `YOUR_HELIUS_API_KEY` placeholders also use the environment key.
+Explicit real keys are preserved. Other providers' URLs retain their own
+configured authentication. Resolved keys are not written back to config or
+stored in the variants journal. Identical variants are journaled once and can be sent to
+multiple endpoints.
+
+Create and fund nonce accounts ahead of time using your Solana CLI, with the
+copier wallet as nonce authority. For example, using your usual CLI RPC config:
+
+```sh
+solana-keygen new --outfile nonce-1.json
+solana create-nonce-account nonce-1.json 0.002 --nonce-authority COPIER_WALLET_PUBKEY --keypair /path/to/copier.json
+solana-keygen pubkey nonce-1.json
+```
+
+Ensure the funding meets the network's nonce-account rent requirement. Add the
+last command's public key to `nonce_accounts`. The trader validates finalized
+account state, ownership, initialization, and authority at startup; it does not
+create accounts or spend account-creation funds automatically. Use a dedicated
+pool for this trader and the same durable SQLite database across restarts.
+
+Preparation reserves a cached nonce, places `AdvanceNonceAccount` first, and
+signs one variant per route. All variants execute the same swap but may have
+different fees/tips. The journal waits for earlier writes and atomically stores
+all variants plus the nonce use **before any submission**. This adds a durable
+SQLite write to send-start latency. Submission requests run concurrently and
+settlement polls all signatures, including after every route reports an error.
+The actual confirmed signature replaces the initial journal signature for
+balance reconciliation and slot tracking. Fee reservations cover the maximum
+configured route tip and priority fee.
+
+Unsent preparation releases its lease. Once journal commitment begins, the
+nonce remains held until a finalized read proves advancement; request errors,
+confirmation timeouts, and dropped tasks never free it. Pool exhaustion fails
+preparation without sending. Nonces do not expire: an unresolved transaction
+could execute later, and a swap execution failure can still consume a nonce.
+Startup recovery checks every persisted variant and refuses to start trading
+while a previous fan-out remains unresolved. Do not delete the database to bypass
+that check. Resolve the signature history/on-chain outcome before restarting;
+there is no automatic cancellation or retry with a fresh nonce.
+
+Nonce rules follow the [Solana durable nonce documentation](https://solana.com/docs/core/transactions/durable-nonces).

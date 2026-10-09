@@ -63,6 +63,7 @@ pub struct LaserstreamSource {
     store: Store,
     recovery: RecoveryClient,
     commitment: CommitmentLevel,
+    lookups: Option<super::LookupCache>,
 }
 
 impl LaserstreamSource {
@@ -80,11 +81,17 @@ impl LaserstreamSource {
             wallet,
             store,
             recovery,
+            lookups: None,
             commitment: match commitment {
                 "confirmed" => CommitmentLevel::Confirmed,
                 _ => CommitmentLevel::Processed,
             },
         }
+    }
+
+    pub(crate) fn with_lookup_cache(mut self, lookups: super::LookupCache) -> Self {
+        self.lookups = Some(lookups);
+        self
     }
 
     fn request(&self) -> SubscribeRequest {
@@ -161,6 +168,9 @@ impl SignalSource for LaserstreamSource {
                         u64::try_from(payload_started.elapsed().as_micros()).unwrap_or(u64::MAX);
                     match decoded {
                         Ok(Some(observed)) => {
+                            if let Some(lookups) = &self.lookups {
+                                lookups.observe(&observed)?;
+                            }
                             let signature = observed.signature.to_string();
                             let slot = observed.slot;
                             let received_bytes = observed.received_bytes;
