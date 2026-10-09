@@ -1,5 +1,7 @@
 mod laserstream;
+mod lookup_cache;
 mod payload;
+mod preconfirmation;
 mod recovery;
 
 use async_trait::async_trait;
@@ -8,6 +10,8 @@ use tokio::sync::mpsc::Sender;
 use crate::{domain::ObservedTransaction, error::Result};
 
 pub use laserstream::{LaserstreamSource, check_connection};
+pub(crate) use lookup_cache::LookupCache;
+pub use preconfirmation::PreconfirmationSource;
 pub use recovery::RecoveryClient;
 
 #[async_trait]

@@ -34,6 +34,8 @@ use tracing::info;
 pub struct ExecutableRoute {
     pub route: PreparedRoute,
     pub transaction: Transaction,
+    pub variants: Vec<Transaction>,
+    pub nonce: Option<crate::mainnet::nonce::NonceLease>,
     pub simulation_json: String,
 }
 
@@ -121,21 +123,38 @@ impl Router {
             let mainnet = backend.mainnet().ok_or_else(|| {
                 CopyTraderError::Execution("mainnet backend is required".to_owned())
             })?;
-            let blockhash = {
+            let nonce = if mainnet.fanout.enabled {
+                Some(mainnet.nonce_pool.reserve()?)
+            } else {
+                None
+            };
+            let blockhash = if let Some(lease) = &nonce {
+                lease.hash
+            } else {
                 let _timer = timings.stages.start("route_shared_preparation_ms");
                 mainnet.cached_blockhash().ok_or_else(|| {
                     CopyTraderError::Execution("background blockhash cache is not ready".to_owned())
                 })?
             };
             let build_timer = timings.stages.start("transaction_build_ms");
-            let instructions = mainnet
-                .finalize_instructions(
+            let instructions = if let Some(lease) = &nonce {
+                mainnet.fanout_instructions(
                     &signer.pubkey(),
-                    &trade.intent.source_signature,
                     route.compute_unit_limit,
-                    route.instructions.clone(),
-                )
-                .await?;
+                    &route.instructions,
+                    lease,
+                    &mainnet.fanout.routes[0],
+                )?
+            } else {
+                mainnet
+                    .finalize_instructions(
+                        &signer.pubkey(),
+                        &trade.intent.source_signature,
+                        route.compute_unit_limit,
+                        route.instructions.clone(),
+                    )
+                    .await?
+            };
             let mut signers: Vec<&dyn Signer> = vec![signer];
             signers.extend(
                 route
@@ -154,12 +173,48 @@ impl Router {
             transaction.try_sign(&signers, blockhash).map_err(|error| {
                 CopyTraderError::Execution(format!("cannot sign source transaction: {error}"))
             })?;
+            let mut variants = Vec::new();
+            if let Some(lease) = &nonce {
+                variants.push(transaction.clone());
+                for config in mainnet.fanout.routes.iter().skip(1) {
+                    let instructions = mainnet.fanout_instructions(
+                        &signer.pubkey(),
+                        route.compute_unit_limit,
+                        &route.instructions,
+                        lease,
+                        config,
+                    )?;
+                    let mut variant = Transaction::new_unsigned(
+                        solana_sdk::message::Message::new_with_blockhash(
+                            &instructions,
+                            Some(&signer.pubkey()),
+                            &blockhash,
+                        ),
+                    );
+                    variant.try_sign(&signers, blockhash).map_err(|e| {
+                        CopyTraderError::Execution(format!("cannot sign fanout variant: {e}"))
+                    })?;
+                    variants.push(variant);
+                }
+            }
+            for tx in &variants {
+                let size = bincode::serialized_size(tx).map_err(|e| {
+                    CopyTraderError::Execution(format!("cannot size transaction: {e}"))
+                })?;
+                if size > 1232 {
+                    return Err(CopyTraderError::Execution(format!(
+                        "signed transaction exceeds Solana packet limit: {size} bytes"
+                    )));
+                }
+            }
             drop(signing_timer);
             route.instructions = instructions;
             info!(dex = route.dex.as_str(), "source instruction copied");
             Ok(ExecutableRoute {
                 route,
                 transaction,
+                variants,
+                nonce,
                 simulation_json: "{\"skipped\":true,\"reason\":\"hot_path_no_simulation\"}"
                     .to_owned(),
             })

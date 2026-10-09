@@ -451,6 +451,7 @@ mod tests {
         for (dex, discriminator) in [
             (DexKind::PumpSwap, [102, 6, 61, 18, 1, 218, 235, 234]),
             (DexKind::PumpSwap, [51, 230, 133, 164, 1, 127, 131, 173]),
+            (DexKind::PumpSwap, [198, 46, 21, 82, 180, 217, 232, 112]),
             (DexKind::PumpSwap, [194, 171, 28, 70, 104, 77, 91, 47]),
         ] {
             let mut observed = observation(dex, discriminator);

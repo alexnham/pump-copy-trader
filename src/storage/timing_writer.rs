@@ -26,6 +26,10 @@ impl TimingWriter {
         Self { sender, task }
     }
 
+    pub(crate) fn sender(&self) -> mpsc::Sender<(String, String)> {
+        self.sender.clone()
+    }
+
     pub(crate) fn enqueue(&self, signature: String, json: String) {
         if let Err(error) = self.sender.try_send((signature, json)) {
             let (source_signature, _) = error.into_inner();

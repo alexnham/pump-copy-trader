@@ -70,11 +70,31 @@ pub struct SignalConfig {
     pub commitment: String,
     #[serde(default = "default_queue_capacity")]
     pub queue_capacity: usize,
+    #[serde(default)]
+    pub preconfirmations: PreconfirmationsConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PreconfirmationsConfig {
+    pub enabled: bool,
+    pub websocket_url: Url,
+}
+
+impl Default for PreconfirmationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            websocket_url: Url::parse("wss://beta.helius-rpc.com/").expect("static URL"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MainnetConfig {
+    #[serde(default)]
+    pub fanout: FanoutConfig,
     #[serde(
         default = "default_source_direct",
         rename = "skip",
@@ -90,6 +110,74 @@ pub struct MainnetConfig {
     pub priority_level: String,
     #[serde(default = "default_max_priority_fee")]
     pub max_priority_fee_micro_lamports: u64,
+}
+
+impl MainnetConfig {
+    /// Resolve only recognized Helius Sender endpoints. Other providers keep
+    /// their own authentication, and explicit real keys take precedence.
+    pub fn with_helius_api_key(&self, api_key: &str) -> Result<Self> {
+        validate_api_key(api_key)?;
+        let mut config = self.clone();
+        inject_sender_api_key(&mut config.sender_url, api_key);
+        for route in &mut config.fanout.routes {
+            inject_sender_api_key(&mut route.url, api_key);
+        }
+        Ok(config)
+    }
+
+    pub fn execution_tip_budget(&self) -> u64 {
+        if self.fanout.enabled {
+            self.fanout
+                .routes
+                .iter()
+                .map(|r| r.tip_lamports)
+                .max()
+                .unwrap_or(0)
+        } else {
+            self.tip_lamports
+        }
+    }
+    pub fn execution_priority_fee(&self) -> u64 {
+        if self.fanout.enabled {
+            self.fanout
+                .routes
+                .iter()
+                .map(|r| r.priority_fee_micro_lamports)
+                .max()
+                .unwrap_or(0)
+        } else {
+            self.fixed_priority_fee_micro_lamports
+                .unwrap_or(self.max_priority_fee_micro_lamports)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FanoutConfig {
+    pub enabled: bool,
+    pub nonce_accounts: Vec<String>,
+    pub routes: Vec<FanoutRouteConfig>,
+    pub submit_timeout_ms: u64,
+}
+impl Default for FanoutConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            nonce_accounts: vec![],
+            routes: vec![],
+            submit_timeout_ms: 1500,
+        }
+    }
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FanoutRouteConfig {
+    pub name: String,
+    pub url: Url,
+    pub tip_account: String,
+    pub tip_lamports: u64,
+    pub priority_fee_micro_lamports: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -168,6 +256,13 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.signal.preconfirmations.enabled
+            && self.signal.preconfirmations.websocket_url.scheme() != "wss"
+        {
+            return Err(CopyTraderError::Configuration(
+                "signal.preconfirmations.websocket_url must use wss".to_owned(),
+            ));
+        }
         if !matches!(self.signal.commitment.as_str(), "processed" | "confirmed") {
             return Err(CopyTraderError::Configuration(
                 "signal.commitment must be \"processed\" or \"confirmed\"".to_owned(),
@@ -294,6 +389,58 @@ impl ExecutionTarget {
 }
 
 fn validate_sender(config: &MainnetConfig) -> Result<()> {
+    let fanout = &config.fanout;
+    if fanout.enabled {
+        use std::{collections::HashSet, str::FromStr};
+        if fanout.nonce_accounts.is_empty()
+            || fanout.routes.is_empty()
+            || fanout.routes.len() > 8
+            || !(1..=10_000).contains(&fanout.submit_timeout_ms)
+        {
+            return Err(CopyTraderError::Configuration(
+                "fanout requires nonce accounts, 1–8 routes, and submit_timeout_ms in 1–10000"
+                    .into(),
+            ));
+        }
+        let mut accounts = HashSet::new();
+        for account in &fanout.nonce_accounts {
+            let key = Pubkey::from_str(account).map_err(|_| {
+                CopyTraderError::Configuration("invalid fanout nonce account".into())
+            })?;
+            if !accounts.insert(key) {
+                return Err(CopyTraderError::Configuration(
+                    "duplicate fanout nonce account".into(),
+                ));
+            }
+        }
+        let mut names = HashSet::new();
+        for route in &fanout.routes {
+            if route.name.is_empty()
+                || !names.insert(&route.name)
+                || !matches!(route.url.scheme(), "http" | "https")
+                || route.url.host_str().is_none()
+                || route.priority_fee_micro_lamports > config.max_priority_fee_micro_lamports
+                || Pubkey::from_str(&route.tip_account).is_err()
+            {
+                return Err(CopyTraderError::Configuration("invalid fanout route: use unique names, HTTP(S) URLs, valid tip accounts, and priority fees within the maximum".into()));
+            }
+            if route.url.host_str().is_some_and(|host| {
+                host == "sender.helius-rpc.com" || host.ends_with("-sender.helius-rpc.com")
+            }) {
+                let mut sender = config.clone();
+                sender.fanout.enabled = false;
+                sender.sender_url = route.url.clone();
+                sender.tip_lamports = route.tip_lamports;
+                validate_sender(&sender)?;
+                if !crate::mainnet::MainnetClient::is_sender_tip_account(&route.tip_account) {
+                    return Err(CopyTraderError::Configuration(
+                        "Helius fanout routes require a Helius Sender tip account".into(),
+                    ));
+                }
+            }
+        }
+    }
+
     if !config.source_direct {
         return Err(CopyTraderError::Configuration(
             "this trader builds only from source instructions; mainnet.skip must be true"
@@ -361,6 +508,44 @@ pub(crate) fn canonical_priority_level(value: &str) -> Option<&'static str> {
         "veryhigh" => Some("VeryHigh"),
         _ => None,
     }
+}
+
+fn inject_sender_api_key(url: &mut Url, api_key: &str) {
+    let recognized = matches!(
+        url.host_str(),
+        Some(
+            "sender.helius-rpc.com"
+                | "slc-sender.helius-rpc.com"
+                | "ewr-sender.helius-rpc.com"
+                | "lon-sender.helius-rpc.com"
+                | "fra-sender.helius-rpc.com"
+                | "ams-sender.helius-rpc.com"
+                | "sg-sender.helius-rpc.com"
+                | "tyo-sender.helius-rpc.com"
+        )
+    );
+    if !recognized || !matches!(url.scheme(), "http" | "https") {
+        return;
+    }
+    let pairs = url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    if pairs.iter().any(|(key, value)| {
+        key == "api-key"
+            && !value.trim().is_empty()
+            && !matches!(value.as_str(), "YOUR_API_KEY" | "YOUR_HELIUS_API_KEY")
+    }) {
+        return;
+    }
+    url.set_query(None);
+    let mut query = url.query_pairs_mut();
+    for (key, value) in pairs {
+        if key != "api-key" {
+            query.append_pair(&key, &value);
+        }
+    }
+    query.append_pair("api-key", api_key.trim());
 }
 
 fn with_api_key(mut url: Url, api_key: &str) -> Result<Url> {
@@ -445,6 +630,104 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sender_urls_use_environment_key_without_leaking_it_to_other_hosts() {
+        let base = AppConfig::load(Path::new("config.example.toml"))
+            .unwrap()
+            .mainnet
+            .unwrap();
+        for endpoint in [
+            "https://sender.helius-rpc.com/fast?swqos_only=true",
+            "http://ewr-sender.helius-rpc.com/fast?api-key=YOUR_HELIUS_API_KEY&swqos_only=true",
+            "https://tyo-sender.helius-rpc.com/fast?api-key=",
+        ] {
+            let mut config = base.clone();
+            config.sender_url = Url::parse(endpoint).unwrap();
+            config.fanout.routes = vec![FanoutRouteConfig {
+                name: "route".into(),
+                url: config.sender_url.clone(),
+                tip_account: Pubkey::new_unique().to_string(),
+                tip_lamports: 5000,
+                priority_fee_micro_lamports: 100000,
+            }];
+            let resolved = config.with_helius_api_key(" env+key&value ").unwrap();
+            for url in [&resolved.sender_url, &resolved.fanout.routes[0].url] {
+                let keys = url
+                    .query_pairs()
+                    .filter(|(key, _)| key == "api-key")
+                    .map(|(_, value)| value.into_owned())
+                    .collect::<Vec<_>>();
+                assert_eq!(keys, vec!["env+key&value"]);
+                assert_eq!(url.path(), "/fast");
+                if endpoint.contains("swqos_only") {
+                    assert!(
+                        url.query_pairs()
+                            .any(|(key, value)| key == "swqos_only" && value == "true")
+                    );
+                }
+            }
+            assert_eq!(
+                config.sender_url.as_str(),
+                endpoint,
+                "saved config is unchanged"
+            );
+        }
+        for endpoint in [
+            "https://sender.helius-rpc.com/fast?api-key=explicit-key",
+            "https://relay.example.com/fast",
+            "https://sender.helius-rpc.com.evil.example/fast",
+            "https://unknown-sender.helius-rpc.com/fast",
+        ] {
+            let mut config = base.clone();
+            config.sender_url = Url::parse(endpoint).unwrap();
+            config.fanout.routes = vec![FanoutRouteConfig {
+                name: "route".into(),
+                url: config.sender_url.clone(),
+                tip_account: Pubkey::new_unique().to_string(),
+                tip_lamports: 5000,
+                priority_fee_micro_lamports: 100000,
+            }];
+            let resolved = config.with_helius_api_key("env-key").unwrap();
+            assert_eq!(resolved.sender_url.as_str(), endpoint);
+            assert_eq!(resolved.fanout.routes[0].url.as_str(), endpoint);
+        }
+        assert!(base.with_helius_api_key(" ").is_err());
+    }
+
+    #[test]
+    fn fanout_validation_and_fee_budgets() {
+        let mut config = AppConfig::load(Path::new("config.example.toml")).unwrap();
+        let mainnet = config.mainnet.as_mut().unwrap();
+        mainnet.fanout.enabled = true;
+        assert!(validate_sender(mainnet).is_err());
+        mainnet.fanout.nonce_accounts = vec![Pubkey::new_unique().to_string()];
+        mainnet.fanout.routes = vec![FanoutRouteConfig {
+            name: "sender".into(),
+            url: mainnet.sender_url.clone(),
+            tip_account: "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE".into(),
+            tip_lamports: 6000,
+            priority_fee_micro_lamports: 200000,
+        }];
+        assert!(validate_sender(mainnet).is_ok());
+        assert_eq!(mainnet.execution_tip_budget(), 6000);
+        assert_eq!(mainnet.execution_priority_fee(), 200000);
+        mainnet.fanout.routes[0].tip_lamports = 1;
+        assert!(validate_sender(mainnet).is_err());
+        mainnet.fanout.routes[0].tip_lamports = 6000;
+        mainnet.fanout.routes[0].priority_fee_micro_lamports =
+            mainnet.max_priority_fee_micro_lamports + 1;
+        assert!(validate_sender(mainnet).is_err());
+        mainnet.fanout.routes[0].priority_fee_micro_lamports = 200000;
+        mainnet
+            .fanout
+            .nonce_accounts
+            .push(mainnet.fanout.nonce_accounts[0].clone());
+        assert!(validate_sender(mainnet).is_err());
+        mainnet.fanout.nonce_accounts.pop();
+        mainnet.fanout.routes.push(mainnet.fanout.routes[0].clone());
+        assert!(validate_sender(mainnet).is_err());
+    }
+
+    #[test]
     fn decimal_validation_rejects_ambiguous_values() {
         assert!(validate_decimal("1.25", "value").is_ok());
         assert!(validate_decimal(".25", "value").is_err());
@@ -468,6 +751,31 @@ mod tests {
         if let Ok(config) = config {
             assert!(config.validate().is_ok());
         }
+    }
+
+    #[test]
+    fn preconfirmations_can_be_disabled_and_default_to_enabled() {
+        let enabled: PreconfirmationsConfig = toml::from_str("").expect("defaults");
+        assert!(enabled.enabled);
+        let disabled: PreconfirmationsConfig = toml::from_str("enabled = false").expect("disabled");
+        assert!(!disabled.enabled);
+        let mut legacy: toml::Value =
+            toml::from_str(include_str!("../config.example.toml")).expect("example");
+        legacy["signal"]
+            .as_table_mut()
+            .expect("signal")
+            .remove("preconfirmations");
+        let config: AppConfig = legacy.try_into().expect("legacy config");
+        assert!(config.signal.preconfirmations.enabled);
+    }
+
+    #[test]
+    fn enabled_preconfirmation_endpoints_require_tls() {
+        let mut config: AppConfig = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        config.signal.preconfirmations.websocket_url = Url::parse("ws://localhost/").unwrap();
+        assert!(config.validate().is_err());
+        config.signal.preconfirmations.enabled = false;
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -534,6 +842,7 @@ mod tests {
             return;
         };
         let mut config = MainnetConfig {
+            fanout: Default::default(),
             source_direct: true,
             fixed_priority_fee_micro_lamports: Some(100),
             sender_url: swqos_url,
@@ -556,6 +865,7 @@ mod tests {
     #[test]
     fn sender_accepts_documented_regions_and_rejects_other_hosts() {
         let mut config = MainnetConfig {
+            fanout: Default::default(),
             source_direct: true,
             fixed_priority_fee_micro_lamports: Some(100),
             sender_url: Url::parse("https://sender.helius-rpc.com/fast").expect("url"),
@@ -594,6 +904,7 @@ mod tests {
         assert!(sender_url.is_ok());
         let Ok(sender_url) = sender_url else { return };
         let config = MainnetConfig {
+            fanout: Default::default(),
             source_direct: true,
             fixed_priority_fee_micro_lamports: Some(100),
             sender_url,
@@ -657,7 +968,7 @@ mod tests {
             .is_err()
         );
         let old_timeout: AppConfig =
-            toml::from_str(&example.replace("timeout_ms =", "race_timeout_ms ="))
+            toml::from_str(&example.replace("timeout_ms = 2000", "race_timeout_ms = 2000"))
                 .expect("timeout alias");
         assert_eq!(old_timeout.routing.timeout_ms, 2000);
     }

@@ -59,14 +59,13 @@ pub(crate) fn copy_source_instruction_with_wsol(
         .try_into()
         .map_err(|_| CopyTraderError::Unsupported("unsupported PumpSwap instruction".to_owned()))?;
     let (first, second) = match discriminator {
-        // buy_exact_quote_in: exact input, minimum base output.
-        [51, 230, 133, 164, 1, 127, 131, 173] => (trade.input_amount, minimum_output),
-        // buy / buy_v2: exact base output, maximum quote input.
-        [102, 6, 61, 18, 1, 218, 235, 234] | [198, 46, 21, 82, 180, 217, 232, 112] => {
-            (minimum_output, trade.input_amount)
-        }
-        // sell / sell_v2 / the supported exact-input sell layout.
-        [184, 23, 238, 97, 103, 197, 211, 61]
+        // buy_exact_quote_in: spendable quote input, minimum base output.
+        [198, 46, 21, 82, 180, 217, 232, 112] => (trade.input_amount, minimum_output),
+        // buy: exact base output, maximum quote input.
+        [102, 6, 61, 18, 1, 218, 235, 234] => (minimum_output, trade.input_amount),
+        // sell and supported exact-input sell layouts.
+        [51, 230, 133, 164, 1, 127, 131, 173]
+        | [184, 23, 238, 97, 103, 197, 211, 61]
         | [194, 171, 28, 70, 104, 77, 91, 47]
         | [93, 246, 130, 60, 231, 233, 64, 178] => (trade.input_amount, minimum_output),
         _ => {

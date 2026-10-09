@@ -22,7 +22,7 @@ pub(super) async fn received_output(
         loop {
             let transaction: Value = rpc.send(RpcRequest::GetTransaction, json!([
                 signature.to_string(),
-                {"encoding":"json", "commitment":"confirmed", "maxSupportedTransactionVersion":0}
+                {"encoding":"json", "commitment":"confirmed", "maxSupportedTransactionVersion":1}
             ])).await.map_err(|error| CopyTraderError::Execution(format!("landed transaction lookup failed: {error}")))?;
             if !transaction.is_null() {
                 return output_delta(&transaction, asset, account, tip);

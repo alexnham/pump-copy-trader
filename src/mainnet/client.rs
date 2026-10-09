@@ -39,9 +39,14 @@ pub struct MainnetClient {
     fixed_priority_fee: u64,
     http: Arc<HttpTransport>,
     blockhash: super::blockhash::BlockhashCache,
+    pub nonce_pool: super::nonce::NoncePool,
+    pub fanout: crate::config::FanoutConfig,
 }
 
 impl MainnetClient {
+    pub(crate) fn is_sender_tip_account(account: &str) -> bool {
+        TIP_ACCOUNTS.contains(&account)
+    }
     pub fn new(rpc_url: Url, config: &MainnetConfig, http: Arc<HttpTransport>) -> Self {
         Self {
             rpc: http.solana_rpc(&rpc_url),
@@ -54,6 +59,8 @@ impl MainnetClient {
                 .min(config.max_priority_fee_micro_lamports),
             http,
             blockhash: super::blockhash::BlockhashCache::default(),
+            nonce_pool: Default::default(),
+            fanout: config.fanout.clone(),
         }
     }
 
@@ -128,6 +135,61 @@ impl MainnetClient {
 
     pub const fn tip_lamports(&self) -> u64 {
         self.tip_lamports
+    }
+
+    pub fn fanout_instructions(
+        &self,
+        payer: &Pubkey,
+        limit: u32,
+        instructions: &[Instruction],
+        lease: &super::nonce::NonceLease,
+        route: &crate::config::FanoutRouteConfig,
+    ) -> Result<Vec<Instruction>> {
+        let tip = Pubkey::from_str(&route.tip_account)
+            .map_err(|_| CopyTraderError::Configuration("invalid fanout tip account".into()))?;
+        let mut result = vec![
+            solana_system_interface::instruction::advance_nonce_account(&lease.account, payer),
+            ComputeBudgetInstruction::set_compute_unit_limit(limit),
+            ComputeBudgetInstruction::set_compute_unit_price(route.priority_fee_micro_lamports),
+        ];
+        result.extend_from_slice(instructions);
+        if route.tip_lamports > 0 {
+            result.push(transfer(payer, &tip, route.tip_lamports));
+        }
+        Ok(result)
+    }
+
+    /// All requests finish (bounded) before settlement; acknowledgments do not
+    /// identify the winner. Even total transport failure can have landed.
+    pub async fn send_fanout(&self, transactions: &[Transaction]) {
+        use futures_util::{StreamExt, stream::FuturesUnordered};
+        let mut requests = FuturesUnordered::new();
+        for (route, transaction) in self.fanout.routes.iter().zip(transactions) {
+            requests.push(async move {
+                let params = sender_params(transaction)?;
+                let result: String = self
+                    .http
+                    .rpc_with_timeout(
+                        &route.url,
+                        "sendTransaction",
+                        params,
+                        Duration::from_millis(self.fanout.submit_timeout_ms),
+                    )
+                    .await?;
+                let signature = parse_sender_signature(&result)?;
+                if transaction.signatures.first() != Some(&signature) {
+                    return Err(CopyTraderError::Execution(
+                        "fanout endpoint returned an unexpected signature".into(),
+                    ));
+                }
+                Ok::<(), CopyTraderError>(())
+            });
+        }
+        while let Some(result) = requests.next().await {
+            if let Err(error) = result {
+                warn!(%error, "fanout submission uncertain; checking all signatures");
+            }
+        }
     }
 
     pub async fn send(&self, transaction: &Transaction) -> Result<Signature> {
@@ -206,6 +268,128 @@ fn choose_tip_account(source_signature: &Signature) -> Result<Pubkey> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn fanout_signs_shared_nonce_variants_and_submits_concurrently() {
+        use crate::{
+            config::{AppConfig, FanoutRouteConfig, HttpConfig},
+            storage::Store,
+            test_rpc::TestRpc,
+        };
+        use solana_sdk::{
+            hash::Hash,
+            signature::{Keypair, Signer},
+        };
+        let signer = Keypair::new();
+        let authority = signer.pubkey();
+        let account = Pubkey::new_unique();
+        let blockhash = Hash::new_unique();
+        let server = TestRpc::start(move |request| {
+            if request["method"] == "getAccountInfo" {
+                return json!({"context":{"slot":42},"value":crate::mainnet::nonce::tests::nonce_value(authority, blockhash)});
+            }
+            let tx: Transaction = bincode::deserialize(&STANDARD.decode(request["params"][0].as_str().unwrap()).unwrap()).unwrap();
+            tx.verify().unwrap();
+            assert_eq!(tx.message.recent_blockhash, solana_nonce::state::Data::new(authority, solana_nonce::state::DurableNonce::from_blockhash(&blockhash), 5000).blockhash());
+            let first = &tx.message.instructions[0];
+            assert_eq!(tx.message.account_keys[first.program_id_index as usize], solana_system_interface::program::ID);
+            assert_eq!(tx.message.account_keys[first.accounts[0] as usize], account);
+            assert_eq!(first.data, solana_system_interface::instruction::advance_nonce_account(&account, &authority).data);
+            assert_eq!(request["params"][1]["maxRetries"], 0);
+            json!({"test_delay_ms":50,"test_result":tx.signatures[0].to_string()})
+        }).await;
+        let mut config = AppConfig::load(std::path::Path::new("config.example.toml"))
+            .unwrap()
+            .mainnet
+            .unwrap();
+        config.fanout.enabled = true;
+        config.fanout.nonce_accounts = vec![account.to_string()];
+        config.fanout.routes = (0..2)
+            .map(|index| FanoutRouteConfig {
+                name: format!("route-{index}"),
+                url: server.url.clone(),
+                tip_account: TIP_ACCOUNTS[index].into(),
+                tip_lamports: 5000,
+                priority_fee_micro_lamports: 100000 + index as u64,
+            })
+            .collect();
+        let client = MainnetClient::new(
+            server.url.clone(),
+            &config,
+            HttpTransport::new(&HttpConfig::default()).unwrap(),
+        );
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        client
+            .nonce_pool
+            .initialize(
+                &client.rpc,
+                &config.fanout.nonce_accounts,
+                authority,
+                &store,
+            )
+            .await
+            .unwrap();
+        let lease = client.nonce_pool.reserve().unwrap();
+        let swap = vec![transfer(&authority, &Pubkey::new_unique(), 1)];
+        let variants = config
+            .fanout
+            .routes
+            .iter()
+            .map(|route| {
+                let instructions = client
+                    .fanout_instructions(&authority, 100000, &swap, &lease, route)
+                    .unwrap();
+                Transaction::new_signed_with_payer(
+                    &instructions,
+                    Some(&authority),
+                    &[&signer],
+                    lease.hash,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(variants[0].signatures[0], variants[1].signatures[0]);
+        client.send_fanout(&variants).await;
+        assert_eq!(server.count("sendTransaction"), 2);
+        assert_eq!(
+            server
+                .peak_in_flight
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_route_timeout_is_bounded() {
+        use crate::{
+            config::{AppConfig, FanoutRouteConfig, HttpConfig},
+            test_rpc::TestRpc,
+        };
+        let server = TestRpc::start(
+            |_| json!({"test_delay_ms":3000,"test_result":Signature::default().to_string()}),
+        )
+        .await;
+        let mut config = AppConfig::load(std::path::Path::new("config.example.toml"))
+            .unwrap()
+            .mainnet
+            .unwrap();
+        config.fanout.submit_timeout_ms = 30;
+        config.fanout.routes = vec![FanoutRouteConfig {
+            name: "slow".into(),
+            url: server.url.clone(),
+            tip_account: TIP_ACCOUNTS[0].into(),
+            tip_lamports: 5000,
+            priority_fee_micro_lamports: 100000,
+        }];
+        let client = MainnetClient::new(
+            server.url.clone(),
+            &config,
+            HttpTransport::new(&HttpConfig::default()).unwrap(),
+        );
+        let started = std::time::Instant::now();
+        client.send_fanout(&[Transaction::default()]).await;
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(server.count("sendTransaction"), 1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn warmer_waits_thirty_seconds_and_stops_when_dropped() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -236,6 +420,7 @@ mod tests {
         let server = TestRpc::start(|_| json!({"test_delay_ms":3000,"test_result":"pong"})).await;
         let transport = HttpTransport::new(&HttpConfig::default()).expect("transport");
         let config = MainnetConfig {
+            fanout: Default::default(),
             source_direct: false,
             fixed_priority_fee_micro_lamports: None,
             sender_url: server.url.clone(),

@@ -53,12 +53,73 @@ pub async fn wait_for_confirmation(
     )))
 }
 
+pub async fn wait_for_any_confirmation(
+    rpc: &RpcClient,
+    signatures: &[Signature],
+    timeout: Duration,
+) -> Result<(Signature, ConfirmedTransaction)> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let response = tokio::time::timeout_at(
+            deadline,
+            rpc.get_signature_statuses_with_history(signatures),
+        )
+        .await;
+        if let Ok(Ok(response)) = response {
+            for (signature, status) in signatures.iter().zip(response.value) {
+                if let Some(status) = status
+                    && status.satisfies_commitment(CommitmentConfig::confirmed())
+                {
+                    return Ok((
+                        *signature,
+                        ConfirmedTransaction {
+                            slot: status.slot,
+                            error: status
+                                .err
+                                .map(|e| format!("fanout transaction failed: {e}")),
+                        },
+                    ));
+                }
+            }
+        }
+        // Transient errors and relay timeouts do not establish non-execution.
+        sleep(Duration::from_millis(250)).await;
+    }
+    Err(CopyTraderError::Execution(
+        "fanout confirmation timed out; nonce remains reserved until finalized advancement".into(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{config::HttpConfig, http::HttpTransport, test_rpc::TestRpc};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn fanout_confirms_second_variant_after_transient_rpc_error() {
+        let polls = AtomicUsize::new(0);
+        let server = TestRpc::start(move |request| {
+            assert_eq!(request["params"][0].as_array().unwrap().len(), 2);
+            assert_eq!(request["params"][1]["searchTransactionHistory"], true);
+            if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return json!({"error":{"code":-32000,"message":"temporary failure"}});
+            }
+            json!({"context":{"slot":43},"value":[null,{"slot":42,"confirmations":1,"err":null,
+                "status":{"Ok":null},"confirmationStatus":"confirmed"}]})
+        })
+        .await;
+        let rpc = HttpTransport::new(&HttpConfig::default())
+            .unwrap()
+            .solana_rpc(&server.url);
+        let signatures = [Signature::new_unique(), Signature::new_unique()];
+        let (winner, status) = wait_for_any_confirmation(&rpc, &signatures, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(winner, signatures[1]);
+        assert_eq!(status.slot, 42);
+    }
 
     #[tokio::test]
     async fn returns_transaction_slot_only_after_confirmation_including_failures() {

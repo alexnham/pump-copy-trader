@@ -14,7 +14,10 @@ use crate::{
     http::HttpTransport,
     mainnet::MainnetClient,
     routing::Router,
-    signal::{LaserstreamSource, RecoveryClient, SignalSource, check_connection},
+    signal::{
+        LaserstreamSource, LookupCache, PreconfirmationSource, RecoveryClient, SignalSource,
+        check_connection,
+    },
     storage::Store,
     telemetry::compact_id,
     token::{
@@ -32,6 +35,16 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Doctor => doctor(&config, &store).await,
         Command::Status { limit } => status(&store, limit).await,
         Command::Latency { limit } => latency(&store, limit).await,
+        Command::TransactionGaps => {
+            let api_key = required_env("HELIUS_API_KEY")?;
+            let endpoint = config.helius_http_url(&api_key)?;
+            crate::storage::run_transaction_gap_worker(
+                store,
+                endpoint,
+                HttpTransport::new(&config.http)?,
+            )
+            .await
+        }
     }
 }
 
@@ -52,9 +65,21 @@ async fn run_service(config: Arc<AppConfig>, store: Store) -> Result<()> {
     let transport = HttpTransport::new(&config.http)?;
     let helius_slot = transport.warm(&helius_http).await?;
     info!(helius_slot, "Helius HTTP transport warmed");
-    let backend = Arc::new(build_backend(&config, helius_http.clone(), transport.clone()).await?);
+    let backend =
+        Arc::new(build_backend(&config, helius_http.clone(), transport.clone(), &api_key).await?);
     if let Some(mainnet) = backend.mainnet() {
         mainnet.warm_sender().await;
+        if mainnet.fanout.enabled {
+            mainnet
+                .nonce_pool
+                .initialize(
+                    &mainnet.rpc,
+                    &mainnet.fanout.nonce_accounts,
+                    signer.pubkey(),
+                    &store,
+                )
+                .await?;
+        }
     }
     resolve_uncertain(&store, &backend).await?;
     let wsol = associated_token_address(
@@ -85,6 +110,16 @@ async fn run_service(config: Arc<AppConfig>, store: Store) -> Result<()> {
         store.clone(),
         transport.clone(),
     );
+    let lookups = LookupCache::default();
+    let preconfirmation_source = config.signal.preconfirmations.enabled.then(|| {
+        PreconfirmationSource::new(
+            config.signal.preconfirmations.websocket_url.clone(),
+            &api_key,
+            config.signal.wallet,
+            store.clone(),
+            lookups.clone(),
+        )
+    });
     let source = LaserstreamSource::new(
         laserstream_endpoint,
         api_key,
@@ -92,7 +127,8 @@ async fn run_service(config: Arc<AppConfig>, store: Store) -> Result<()> {
         store.clone(),
         recovery,
         &config.signal.commitment,
-    );
+    )
+    .with_lookup_cache(lookups);
     let decoder = TransactionDecoder::new(config.signal.wallet);
     let execution_rpc = Arc::new(transport.solana_rpc(&helius_http));
     let allowed_mints = config
@@ -120,7 +156,7 @@ async fn run_service(config: Arc<AppConfig>, store: Store) -> Result<()> {
     ));
     let worker = ExecutionWorker::new(
         config.clone(),
-        signer,
+        signer.clone(),
         store,
         backend.clone(),
         TokenSafetyClient::new(&helius_http, &transport),
@@ -136,13 +172,21 @@ async fn run_service(config: Arc<AppConfig>, store: Store) -> Result<()> {
         wallet = %compact_id(config.signal.wallet.to_string()),
         "starting tracking wallet stream"
     );
+    let preconfirmation_task = preconfirmation_source.map(|source| {
+        let sender = sender.clone();
+        tokio::spawn(async move { source.run(sender).await })
+    });
     let mut source_task = tokio::spawn(async move { source.run(sender).await });
     let mut worker_task = tokio::spawn(async move { worker.run(receiver).await });
     info!(wallet = %compact_id(config.signal.wallet.to_string()), target = backend.label(), "copy trader running");
 
     let sender_warming = async {
         if let Some(mainnet) = backend.mainnet() {
-            tokio::join!(mainnet.keep_sender_warm(), mainnet.keep_blockhash_fresh());
+            tokio::join!(
+                mainnet.keep_sender_warm(),
+                mainnet.keep_blockhash_fresh(),
+                mainnet.nonce_pool.keep_fresh(&mainnet.rpc, signer.pubkey())
+            );
         } else {
             std::future::pending::<()>().await;
         }
@@ -150,7 +194,7 @@ async fn run_service(config: Arc<AppConfig>, store: Store) -> Result<()> {
     let mut journal_finished = false;
     let mut source_finished = false;
     let mut worker_finished = false;
-    let result = tokio::select! {
+    let mut result = tokio::select! {
         result = journal_writer.wait() => { journal_finished = true; result },
         () = sender_warming => Ok(()),
         result = &mut source_task => { source_finished = true; join_result("signal source", result) },
@@ -162,12 +206,24 @@ async fn run_service(config: Arc<AppConfig>, store: Store) -> Result<()> {
         }
     };
     source_task.abort();
-    worker_task.abort();
+    if let Some(task) = preconfirmation_task {
+        task.abort();
+        let _ = task.await;
+    }
+    if result.is_err() {
+        worker_task.abort();
+    }
     if !source_finished {
         let _ = source_task.await;
     }
     if !worker_finished {
-        let _ = worker_task.await;
+        if result.is_ok() {
+            if let Err(error) = join_result("execution worker", worker_task.await) {
+                result = Err(error);
+            }
+        } else {
+            let _ = worker_task.await;
+        }
     }
     if !journal_finished {
         journal_writer.wait().await?;
@@ -181,10 +237,22 @@ async fn doctor(config: &AppConfig, store: &Store) -> Result<()> {
     let signer = load_keypair(Path::new(&keypair_path))?;
     let laserstream_endpoint = config.laserstream_endpoint(&api_key)?;
     check_connection(laserstream_endpoint, &api_key).await?;
+    if config.signal.preconfirmations.enabled {
+        PreconfirmationSource::new(
+            config.signal.preconfirmations.websocket_url.clone(),
+            &api_key,
+            config.signal.wallet,
+            store.clone(),
+            LookupCache::default(),
+        )
+        .check_connection()
+        .await?;
+        println!("Helius preconfirmation WebSocket: reachable");
+    }
     let helius_http = config.helius_http_url(&api_key)?;
     let transport = HttpTransport::new(&config.http)?;
     let _ = transport.warm(&helius_http).await?;
-    let backend = build_backend(config, helius_http.clone(), transport.clone()).await?;
+    let backend = build_backend(config, helius_http.clone(), transport.clone(), &api_key).await?;
     let token_safety = TokenSafetyClient::new(&helius_http, &transport);
     for rule in &config.tokens {
         let mint = token_safety.inspect_mint(&rule.mint).await?;
@@ -306,18 +374,39 @@ async fn resolve_uncertain(store: &Store, backend: &ExecutionBackend) -> Result<
             "marked attempts without persisted signatures as unknown"
         );
     }
+    let mut unresolved_fanout = false;
     for (source_signature, local_signature) in store.unresolved_attempts(backend.target()).await? {
-        let signature = Signature::from_str(&local_signature).map_err(|error| {
-            CopyTraderError::Storage(format!("invalid stored local signature: {error}"))
-        })?;
+        let variants = store.variant_signatures(&source_signature).await?;
+        let is_fanout = !variants.is_empty();
+        let candidates = if variants.is_empty() {
+            vec![local_signature.clone()]
+        } else {
+            variants
+        };
+        let signatures = candidates
+            .iter()
+            .map(|s| Signature::from_str(s))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CopyTraderError::Storage(format!("invalid variant signature: {e}")))?;
         let statuses = backend
             .rpc()
-            .get_signature_statuses_with_history(&[signature])
+            .get_signature_statuses_with_history(&signatures)
             .await
             .map_err(|error| {
                 CopyTraderError::Execution(format!("uncertain signature query failed: {error}"))
             })?;
-        match statuses.value.first() {
+        let selected = statuses.value.iter().enumerate().find(|(_, status)| {
+            status.as_ref().is_some_and(|status| {
+                status
+                    .satisfies_commitment(solana_client::rpc_config::CommitmentConfig::confirmed())
+            })
+        });
+        if let Some((index, _)) = selected {
+            store
+                .select_variant(&source_signature, &candidates[index])
+                .await?;
+        }
+        match selected.map(|(_, status)| status) {
             Some(Some(status))
                 if status.satisfies_commitment(
                     solana_client::rpc_config::CommitmentConfig::confirmed(),
@@ -341,9 +430,13 @@ async fn resolve_uncertain(store: &Store, backend: &ExecutionBackend) -> Result<
                 }
             }
             _ => {
+                unresolved_fanout |= is_fanout;
                 warn!(source = %compact_id(&source_signature), local = %compact_id(&local_signature), "submission remains uncertain")
             }
         }
+    }
+    if unresolved_fanout {
+        return Err(CopyTraderError::Execution("unresolved nonce fanout from a previous run; resolve its on-chain outcome before restarting trading".into()));
     }
     Ok(())
 }
@@ -352,13 +445,15 @@ async fn build_backend(
     config: &AppConfig,
     helius_http: url::Url,
     transport: Arc<HttpTransport>,
+    api_key: &str,
 ) -> Result<ExecutionBackend> {
     match config.execution.target {
         ExecutionTarget::Mainnet => {
             let mainnet_config = config.mainnet.as_ref().ok_or_else(|| {
                 CopyTraderError::Configuration("missing [mainnet] configuration".to_owned())
             })?;
-            let client = Arc::new(MainnetClient::new(helius_http, mainnet_config, transport));
+            let resolved_config = mainnet_config.with_helius_api_key(api_key)?;
+            let client = Arc::new(MainnetClient::new(helius_http, &resolved_config, transport));
             let slot = client.warm().await?;
             info!(target = "mainnet", slot, "execution backend ready");
             Ok(ExecutionBackend::Mainnet(client))
@@ -403,6 +498,77 @@ mod landing_tests {
     use serde_json::json;
 
     #[tokio::test]
+    async fn fanout_recovery_selects_landed_variant_and_blocks_unknown_restart() {
+        use crate::{
+            config::{HttpConfig, MainnetConfig},
+            test_rpc::TestRpc,
+        };
+        use serde_json::json;
+        for confirmed in [true, false] {
+            let first = Signature::new_unique();
+            let second = Signature::new_unique();
+            let server = TestRpc::start(move |request| {
+                let signatures = request["params"][0].as_array().unwrap();
+                assert_eq!(signatures.len(), 2);
+                let statuses = signatures.iter().map(|signature| {
+                    if confirmed && signature.as_str().unwrap() == second.to_string() {
+                        json!({"slot":45,"confirmations":1,"err":null,"status":{"Ok":null},"confirmationStatus":"confirmed"})
+                    } else { json!(null) }
+                }).collect::<Vec<_>>();
+                json!({"context":{"slot":999},"value":statuses})
+            }).await;
+            let config = MainnetConfig {
+                fanout: Default::default(),
+                source_direct: false,
+                fixed_priority_fee_micro_lamports: None,
+                sender_url: server.url.clone(),
+                tip_lamports: 5000,
+                priority_level: "High".into(),
+                max_priority_fee_micro_lamports: 100,
+            };
+            let backend = ExecutionBackend::Mainnet(Arc::new(MainnetClient::new(
+                server.url.clone(),
+                &config,
+                HttpTransport::new(&HttpConfig::default()).unwrap(),
+            )));
+            let store = Store::connect("sqlite::memory:").await.unwrap();
+            store
+                .record_recovered_signature("source", 42)
+                .await
+                .unwrap();
+            store
+                .reserve_attempt("source", ExecutionTarget::Mainnet, 100, 90)
+                .await
+                .unwrap();
+            store
+                .persist_fanout(
+                    "source",
+                    "account",
+                    "nonce",
+                    &[
+                        (first.to_string(), vec![1], "first".into()),
+                        (second.to_string(), vec![2], "second".into()),
+                    ],
+                    "{}",
+                )
+                .await
+                .unwrap();
+            let result = resolve_uncertain(&store, &backend).await;
+            assert_eq!(result.is_ok(), confirmed);
+            let rows = store.status(1).await.unwrap();
+            if confirmed {
+                assert_eq!(
+                    rows[0].local_signature.as_deref(),
+                    Some(second.to_string().as_str())
+                );
+                assert_eq!(rows[0].copy_status.as_deref(), Some("landed"));
+                assert_eq!(rows[0].landed_slot, Some(45));
+            }
+            assert_eq!(server.count("sendTransaction"), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn recovery_records_confirmed_slots_and_leaves_processed_uncertain() {
         for (commitment, failed) in [
             ("confirmed", false),
@@ -419,6 +585,7 @@ mod landing_tests {
             }).await;
             let transport = HttpTransport::new(&HttpConfig::default()).expect("transport");
             let config = MainnetConfig {
+                fanout: Default::default(),
                 source_direct: false,
                 fixed_priority_fee_micro_lamports: None,
                 sender_url: server.url.clone(),

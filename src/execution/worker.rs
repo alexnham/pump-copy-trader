@@ -7,22 +7,25 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
-use tokio::sync::mpsc::Receiver;
+use tokio::{
+    sync::{Mutex, mpsc::Receiver},
+    task::JoinSet,
+};
 use tracing::{error, info, warn};
 
 use crate::{
     config::AppConfig,
     decode::TransactionDecoder,
     domain::{
-        AssetId, AttemptStatus, ObservedTransaction, SkipReason, TradeIntent, UiTokenBalance,
-        UnsupportedReason,
+        AssetId, AttemptStatus, ObservedTransaction, SizedTrade, SkipReason, TradeIntent,
+        UiTokenBalance, UnsupportedReason,
     },
     error::{CopyTraderError, Result},
     execution::{
         ExecutionBackend, cache::WalletBalanceCache, confirm::wait_for_confirmation,
         sizing::SizingPolicy,
     },
-    routing::{Router, RoutingTimings, pump_fun},
+    routing::{ExecutableRoute, Router, RoutingTimings, pump_fun},
     signal::QueuedObservation,
     storage::{DatabaseTimings, Store, TimingWriter},
     token::{
@@ -40,7 +43,13 @@ pub struct ExecutionWorker {
     decoder: TransactionDecoder,
     router: Arc<Router>,
     balance_cache: WalletBalanceCache,
-    last_executed_slot: u64,
+    last_submitted_slot: u64,
+    pending: JoinSet<()>,
+    reservations: Arc<Mutex<BalanceReservations>>,
+    dispatched: bool,
+    reservation_gate: Arc<Mutex<()>>,
+    handled_signatures: std::collections::HashSet<solana_sdk::signature::Signature>,
+    execution_admitted: bool,
 }
 
 impl ExecutionWorker {
@@ -62,7 +71,13 @@ impl ExecutionWorker {
             decoder,
             router,
             balance_cache: WalletBalanceCache::default(),
-            last_executed_slot: 0,
+            last_submitted_slot: 0,
+            pending: JoinSet::new(),
+            reservations: Default::default(),
+            dispatched: false,
+            reservation_gate: Default::default(),
+            handled_signatures: Default::default(),
+            execution_admitted: false,
         }
     }
 
@@ -74,6 +89,11 @@ impl ExecutionWorker {
     pub async fn run(mut self, input: Receiver<QueuedObservation>) -> Result<()> {
         let writer = TimingWriter::new(self.store.clone());
         let result = self.run_inner(input, &writer).await;
+        while let Some(result) = self.pending.join_next().await {
+            if let Err(error) = result {
+                error!(%error, "background settlement task failed; reservations retained");
+            }
+        }
         writer.finish().await;
         result
     }
@@ -84,11 +104,40 @@ impl ExecutionWorker {
         writer: &TimingWriter,
     ) -> Result<()> {
         while let Some(queued) = input.recv().await {
+            if self.handled_signatures.contains(&queued.observed.signature) {
+                continue;
+            }
+            let preconfirmation =
+                queued.observed.origin == crate::domain::SignalOrigin::Preconfirmation;
+            if preconfirmation
+                && queued.received_at.elapsed().as_secs()
+                    > self.config.execution.max_signal_age_seconds
+            {
+                warn!("stale queued preconfirmation deferred to processed stream");
+                continue;
+            }
+            while let Some(result) = self.pending.try_join_next() {
+                if let Err(error) = result {
+                    error!(%error, "background settlement task failed; reservations retained");
+                }
+            }
+            // Bound settlement RPC fanout during sustained bursts.
+            if self.pending.len() >= 64 {
+                if let Some(Err(error)) = self.pending.join_next().await {
+                    error!(%error, "background settlement task failed; reservations retained");
+                }
+            }
+            self.dispatched = false;
+            self.execution_admitted = false;
             let worker_started = Instant::now();
             let queue_wait_us =
                 CopyTimings::micros(worker_started.duration_since(queued.queued_at));
             let source_signature = queued.observed.signature.to_string();
+            let signature = queued.observed.signature;
             let mut timings = CopyTimings::new(queued.received_at);
+            timings
+                .values
+                .insert("preconfirmation", u64::from(preconfirmation));
             timings.values.insert("queue_wait_us", queue_wait_us);
             timings
                 .values
@@ -102,9 +151,16 @@ impl ExecutionWorker {
             );
             timings.database = queued.database_timings;
             self.store = self.store.with_timings(timings.database.clone());
-            let result = self.handle(queued.observed, &mut timings).await;
+            let result = self.handle(queued.observed, &mut timings, writer).await;
+            if !preconfirmation || self.execution_admitted {
+                self.handled_signatures.insert(signature);
+            }
             timings.finish();
             if let Err(error) = result {
+                if preconfirmation && !self.execution_admitted {
+                    warn!(%error, %source_signature, "preconfirmation preparation deferred to processed stream");
+                    continue;
+                }
                 if let CopyTraderError::OutOfScope(reason, message) = &error {
                     self.store
                         .mark_unsupported(&source_signature, *reason, message)
@@ -128,6 +184,9 @@ impl ExecutionWorker {
                     error!(%error, %source_signature, "copy attempt failed");
                 }
             }
+            if self.dispatched {
+                continue;
+            }
             let json = timings.json()?;
             info!(%source_signature, timings = %json, "copy timings");
             writer.enqueue(source_signature, json);
@@ -139,10 +198,13 @@ impl ExecutionWorker {
         &mut self,
         observed: ObservedTransaction,
         timings: &mut CopyTimings,
+        writer: &TimingWriter,
     ) -> Result<()> {
+        let reservation_gate = self.reservation_gate.clone();
+        let _reservation_guard = reservation_gate.lock().await;
         let checks_started = Instant::now();
         let source_signature = observed.signature.to_string();
-        if observed.slot < self.last_executed_slot {
+        if observed.slot < self.last_submitted_slot {
             self.store
                 .mark_skipped(&source_signature, SkipReason::OutOfOrder)
                 .await?;
@@ -289,7 +351,18 @@ impl ExecutionWorker {
                     source.instruction.program_id == crate::domain::DexKind::PumpSwap.program_id()
                 });
         let cached_wsol = if pump_swap_buy {
-            self.balance_cache.get(&input_account).await.unwrap_or(0)
+            let reserved = self
+                .reservations
+                .lock()
+                .await
+                .remaining
+                .get(&input_account)
+                .copied();
+            if let Some(amount) = reserved {
+                amount
+            } else {
+                self.balance_cache.get(&input_account).await.unwrap_or(0)
+            }
         } else {
             0
         };
@@ -314,9 +387,7 @@ impl ExecutionWorker {
                 let mainnet = self.config.mainnet.as_ref().ok_or_else(|| {
                     CopyTraderError::Execution("mainnet configuration missing".into())
                 })?;
-                let price = mainnet.fixed_priority_fee_micro_lamports.ok_or_else(|| {
-                    CopyTraderError::Execution("fixed priority fee missing".into())
-                })?;
+                let price = mainnet.execution_priority_fee();
                 let priority = u64::from(crate::routing::pump_swap::COMPUTE_UNIT_LIMIT)
                     .checked_mul(price)
                     .and_then(|value| value.checked_add(999_999))
@@ -325,7 +396,7 @@ impl ExecutionWorker {
                 let required_native = wrap_lamports
                     .checked_add(priority)
                     .and_then(|value| value.checked_add(5_000))
-                    .and_then(|value| value.checked_add(mainnet.tip_lamports))
+                    .and_then(|value| value.checked_add(mainnet.execution_tip_budget()))
                     .ok_or_else(|| CopyTraderError::Execution("native funding overflow".into()))?;
                 if native_available < required_native {
                     self.store
@@ -341,18 +412,21 @@ impl ExecutionWorker {
                 .await?;
             return Ok(());
         }
-        if !self
-            .store
-            .reserve_attempt(
-                &source_signature,
-                self.backend.target(),
-                sized.input_amount,
-                0,
-            )
-            .await?
+        let preconfirmation = observed.origin == crate::domain::SignalOrigin::Preconfirmation;
+        if !preconfirmation
+            && !self
+                .store
+                .reserve_attempt(
+                    &source_signature,
+                    self.backend.target(),
+                    sized.input_amount,
+                    0,
+                )
+                .await?
         {
             return Ok(());
         }
+        self.execution_admitted = !preconfirmation;
 
         timings.values.insert(
             "pre_route_preparation_us",
@@ -382,6 +456,24 @@ impl ExecutionWorker {
         timings.values.insert("route_ms", route_latency_ms);
         timings.values.extend(routing_timings.stages.snapshot());
         let winner = result?;
+        // Build early candidates before claiming, so unsupported routes can still
+        // be retried with the processed transaction's execution metadata.
+        if preconfirmation {
+            if !self
+                .store
+                .reserve_attempt(
+                    &source_signature,
+                    self.backend.target(),
+                    sized.input_amount,
+                    winner.route.minimum_output,
+                )
+                .await?
+            {
+                self.execution_admitted = true; // Another feed or a previous run already claimed it.
+                return Ok(());
+            }
+            self.execution_admitted = true;
+        }
         timings.mark("quote_complete_ms");
         timings.mark("checks_complete_ms");
         timings.stage("post_route_ms");
@@ -413,6 +505,88 @@ impl ExecutionWorker {
         timings
             .values
             .insert("db_pre_send_us", timings.database.total_us());
+        let native = self
+            .cached_asset_balance(AssetId::NativeSol, &self.signer.pubkey())
+            .await?;
+        let mainnet =
+            self.config.mainnet.as_ref().ok_or_else(|| {
+                CopyTraderError::Execution("mainnet configuration missing".into())
+            })?;
+        // Reserve worst-case CU fees plus room for ATA/account rent and base fees.
+        let fee_budget = mainnet
+            .execution_priority_fee()
+            .checked_mul(1_400_000)
+            .and_then(|v| v.checked_add(999_999))
+            .map(|v| v / 1_000_000)
+            .and_then(|v| v.checked_add(mainnet.execution_tip_budget()))
+            .and_then(|v| v.checked_add(10_000_000))
+            .ok_or_else(|| CopyTraderError::Execution("fee reservation overflow".into()))?;
+        let native_input = if sized.intent.input_asset == AssetId::NativeSol {
+            if pump_swap_buy {
+                wrap_lamports
+            } else {
+                sized.input_amount
+            }
+        } else {
+            0
+        };
+        let native_debit = native_input
+            .checked_add(fee_budget)
+            .ok_or_else(|| CopyTraderError::Execution("native reservation overflow".into()))?;
+        let mut debits = vec![(self.signer.pubkey(), native, native_debit)];
+        if sized.intent.input_asset != AssetId::NativeSol {
+            debits.push((input_account, available, sized.input_amount));
+        } else if pump_swap_buy && cached_wsol > 0 {
+            debits.push((
+                input_account,
+                cached_wsol,
+                cached_wsol.min(sized.input_amount),
+            ));
+        }
+        if !self.reservations.lock().await.can_reserve(&debits) {
+            self.store
+                .update_attempt(
+                    &source_signature,
+                    AttemptStatus::Failed,
+                    Some("insufficient unreserved balance for input, fees, tip, and rent"),
+                )
+                .await?;
+            self.store
+                .mark_skipped(&source_signature, SkipReason::InsufficientBalance)
+                .await?;
+            return Ok(());
+        }
+        if let Some(lease) = &winner.nonce {
+            let mainnet = self.backend.mainnet().expect("mainnet backend");
+            let variants = winner
+                .variants
+                .iter()
+                .zip(&mainnet.fanout.routes)
+                .map(|(tx, route)| {
+                    Ok((
+                        tx.signatures[0].to_string(),
+                        bincode::serialize(tx).map_err(|e| {
+                            CopyTraderError::Execution(format!(
+                                "cannot serialize fanout variant: {e}"
+                            ))
+                        })?,
+                        route.name.clone(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // Arm before awaiting the commit: cancellation during a commit must
+            // conservatively keep this nonce held until a restart checks the DB.
+            lease.mark_submitted();
+            self.store
+                .persist_fanout(
+                    &source_signature,
+                    &lease.account.to_string(),
+                    &lease.hash.to_string(),
+                    &variants,
+                    &winner.simulation_json,
+                )
+                .await?;
+        }
         let invalidation_started = Instant::now();
         self.invalidate_balances(
             sized.intent.input_asset,
@@ -421,6 +595,13 @@ impl ExecutionWorker {
             &output_account,
         )
         .await?;
+        // The gate prevents settlement from resetting the budget between the
+        // admission check and this debit. No fallible preparation follows it.
+        if !self.reservations.lock().await.reserve(&debits) {
+            return Err(CopyTraderError::Execution(
+                "balance reservation changed during preparation".into(),
+            ));
+        }
         timings.values.insert(
             "cache_invalidation_us",
             CopyTimings::micros(invalidation_started.elapsed()),
@@ -437,7 +618,18 @@ impl ExecutionWorker {
             CopyTimings::micros(timings.received_at.elapsed()),
         );
         let sender_started = Instant::now();
-        let send_result = self.backend.send(&winner.transaction).await;
+        self.last_submitted_slot = self.last_submitted_slot.max(observed.slot);
+        let send_result = if winner.nonce.is_some() {
+            self.backend
+                .mainnet()
+                .expect("mainnet backend")
+                .send_fanout(&winner.variants)
+                .await;
+            // Poll all locally known signatures even when every request errored.
+            Ok(local_signature)
+        } else {
+            self.backend.send(&winner.transaction).await
+        };
         timings.values.insert(
             "sender_request_us",
             CopyTimings::micros(sender_started.elapsed()),
@@ -460,22 +652,28 @@ impl ExecutionWorker {
         {
             warn!(%error, %source_signature, %local_signature, "route journal write failed after submission");
         }
-        if let Err(error) = self
-            .store
-            .persist_signed(
-                &source_signature,
-                &local_signature.to_string(),
-                &signed,
-                &winner.simulation_json,
-            )
-            .await
-        {
-            warn!(%error, %source_signature, %local_signature, "signed transaction journal write failed after submission");
+        if winner.nonce.is_none() {
+            if let Err(error) = self
+                .store
+                .persist_signed(
+                    &source_signature,
+                    &local_signature.to_string(),
+                    &signed,
+                    &winner.simulation_json,
+                )
+                .await
+            {
+                warn!(%error, %source_signature, %local_signature, "signed transaction journal write failed after submission");
+            }
         }
         timings.finish();
         match send_result {
             Ok(returned) if returned == local_signature => {}
             Ok(returned) => {
+                let mut reservations = self.reservations.lock().await;
+                reservations.uncertain = true;
+                reservations.pending -= 1;
+                drop(reservations);
                 self.store
                     .update_attempt(
                         &source_signature,
@@ -486,6 +684,10 @@ impl ExecutionWorker {
                 return Ok(());
             }
             Err(error) => {
+                let mut reservations = self.reservations.lock().await;
+                reservations.uncertain = true;
+                reservations.pending -= 1;
+                drop(reservations);
                 self.store
                     .update_attempt(
                         &source_signature,
@@ -496,17 +698,133 @@ impl ExecutionWorker {
                 return Ok(());
             }
         }
-        timings.stage("confirmation_ms");
-        let confirmation = match wait_for_confirmation(
-            self.backend.rpc(),
-            self.backend.label(),
-            &local_signature,
-            Duration::from_secs(self.config.execution.confirmation_timeout_seconds),
+        let mut settlement = Self::new(
+            self.config.clone(),
+            self.signer.clone(),
+            self.store.clone(),
+            self.backend.clone(),
+            self.token_safety.clone(),
+            TransactionDecoder::new(self.config.signal.wallet),
+            self.router.clone(),
         )
-        .await
-        {
-            Ok(confirmation) => confirmation,
+        .with_balance_cache(self.balance_cache.clone());
+        settlement.reservations = self.reservations.clone();
+        settlement.reservation_gate = self.reservation_gate.clone();
+        let timings = timings.clone();
+        self.dispatched = true;
+        let timing_sender = writer.sender();
+        self.pending.spawn(settlement.run_settlement(
+            PendingCopy {
+                observed,
+                sized,
+                winner,
+                input_account,
+                output_account,
+                local_signature,
+                route_latency_ms,
+            },
+            timings,
+            timing_sender,
+        ));
+        Ok(())
+    }
+
+    async fn run_settlement(
+        mut self,
+        copy: PendingCopy,
+        mut timings: CopyTimings,
+        timing_sender: tokio::sync::mpsc::Sender<(String, String)>,
+    ) {
+        let source_signature = copy.observed.signature.to_string();
+        let result = self.settle(copy, &mut timings).await;
+        if let Err(error) = result {
+            if let Err(journal_error) = self
+                .store
+                .update_attempt(
+                    &source_signature,
+                    AttemptStatus::Failed,
+                    Some(&error.to_string()),
+                )
+                .await
+            {
+                error!(%journal_error, %source_signature, "background outcome journal failed");
+            }
+            error!(%error, %source_signature, "copy settlement failed");
+        }
+        // Keep debits conservative across the entire overlapping batch. Unknown
+        // submissions hold their budget until startup recovery.
+        let _gate = self.reservation_gate.lock().await;
+        let mut reservations = self.reservations.lock().await;
+        reservations.pending -= 1;
+        if reservations.pending == 0 && !reservations.uncertain {
+            for address in reservations.remaining.keys() {
+                if let Err(error) = self.balance_cache.invalidate(address).await {
+                    error!(%error, "reservation cache invalidation failed");
+                    reservations.uncertain = true;
+                    break;
+                }
+            }
+            if !reservations.uncertain {
+                reservations.remaining.clear();
+            }
+        }
+        drop(reservations);
+        timings.finish();
+        if let Ok(json) = timings.json() {
+            info!(%source_signature, timings = %json, "copy timings");
+            if let Err(error) = timing_sender.try_send((source_signature, json)) {
+                let (source_signature, _) = error.into_inner();
+                warn!(%source_signature, "timing queue unavailable; copy timings remain in logs");
+            }
+        }
+    }
+
+    async fn settle(&mut self, copy: PendingCopy, timings: &mut CopyTimings) -> Result<()> {
+        let PendingCopy {
+            observed,
+            sized,
+            winner,
+            input_account,
+            output_account,
+            mut local_signature,
+            route_latency_ms,
+        } = copy;
+        let source_signature = observed.signature.to_string();
+        timings.stage("confirmation_ms");
+        let confirmation_result = if winner.nonce.is_some() {
+            let signatures = winner
+                .variants
+                .iter()
+                .map(|tx| tx.signatures[0])
+                .collect::<Vec<_>>();
+            super::confirm::wait_for_any_confirmation(
+                self.backend.rpc(),
+                &signatures,
+                Duration::from_secs(self.config.execution.confirmation_timeout_seconds),
+            )
+            .await
+        } else {
+            wait_for_confirmation(
+                self.backend.rpc(),
+                self.backend.label(),
+                &local_signature,
+                Duration::from_secs(self.config.execution.confirmation_timeout_seconds),
+            )
+            .await
+            .map(|status| (local_signature, status))
+        };
+        let confirmation = match confirmation_result {
+            Ok((signature, confirmation)) => {
+                local_signature = signature;
+                if winner.nonce.is_some() {
+                    self.store
+                        .select_variant(&source_signature, &signature.to_string())
+                        .await?;
+                }
+                confirmation
+            }
             Err(error) => {
+                self.reservations.lock().await.uncertain = true;
                 self.store
                     .update_attempt(
                         &source_signature,
@@ -543,53 +861,43 @@ impl ExecutionWorker {
         }
 
         timings.stage("reconciliation_ms");
-        let (input_after, _, wsol_after) = tokio::try_join!(
+        let owner = self.signer.pubkey();
+        tokio::try_join!(
             self.asset_balance_network(sized.intent.input_asset, &input_account),
             self.asset_balance_network(sized.intent.output_asset, &output_account),
             async {
-                if winner.route.dex == crate::domain::DexKind::PumpSwap
-                    && (sized.intent.input_asset == AssetId::NativeSol
-                        || sized.intent.output_asset == AssetId::NativeSol)
-                {
-                    self.asset_balance_network(
-                        AssetId::Token(spl_token::native_mint::id()),
-                        &associated_token_address(
-                            &self.signer.pubkey(),
-                            &spl_token::native_mint::id(),
-                            &spl_token::id(),
-                        ),
-                    )
-                    .await
-                } else if sized.intent.input_asset != AssetId::NativeSol
+                if sized.intent.input_asset != AssetId::NativeSol
                     && sized.intent.output_asset != AssetId::NativeSol
                 {
-                    self.asset_balance_network(AssetId::NativeSol, &self.signer.pubkey())
-                        .await
+                    self.asset_balance_network(AssetId::NativeSol, &owner).await
                 } else {
                     Ok(0)
                 }
-            }
+            },
         )?;
-        let input_after = if pump_swap_buy {
-            input_after.checked_add(wsol_after).ok_or_else(|| {
-                CopyTraderError::Execution("combined post-trade SOL balance overflow".into())
-            })?
-        } else {
-            input_after
-        };
-        let spent = available.checked_sub(input_after).ok_or_else(|| {
-            CopyTraderError::Execution("input balance increased after swap".to_owned())
-        })?;
-        if spent < sized.input_amount {
-            warn!(
-                %source_signature,
-                %local_signature,
-                observed_debit = spent,
-                prepared_input = sized.input_amount,
-                "landed transaction confirmed, but the post-confirmation input balance under-reported the debit"
-            );
+        if winner.route.dex == crate::domain::DexKind::PumpSwap {
+            self.asset_balance_network(
+                AssetId::Token(spl_token::native_mint::id()),
+                &associated_token_address(
+                    &self.signer.pubkey(),
+                    &spl_token::native_mint::id(),
+                    &spl_token::id(),
+                ),
+            )
+            .await?;
         }
 
+        let landed_tip = self.backend.mainnet().map_or(0, |mainnet| {
+            if winner.nonce.is_some() {
+                winner
+                    .variants
+                    .iter()
+                    .position(|tx| tx.signatures[0] == local_signature)
+                    .map_or(0, |index| mainnet.fanout.routes[index].tip_lamports)
+            } else {
+                mainnet.tip_lamports()
+            }
+        });
         let metadata_started = Instant::now();
         let persistent_wsol_output = winner.route.dex == crate::domain::DexKind::PumpSwap
             && sized.intent.output_asset == AssetId::NativeSol;
@@ -606,9 +914,7 @@ impl ExecutionWorker {
             } else {
                 output_account
             },
-            self.backend
-                .mainnet()
-                .map_or(0, |mainnet| mainnet.tip_lamports()),
+            landed_tip,
             Duration::from_secs(self.config.execution.confirmation_timeout_seconds),
         )
         .await;
@@ -630,7 +936,6 @@ impl ExecutionWorker {
         self.store
             .update_attempt(&source_signature, AttemptStatus::Landed, None)
             .await?;
-        self.last_executed_slot = observed.slot;
         info!(%source_signature, %local_signature, dex = winner.route.dex.as_str(), pool = %winner.route.pool, source_slot = observed.slot, landed_slot = confirmation.slot, route_latency_ms, "copy landed");
         Ok(())
     }
@@ -725,14 +1030,38 @@ impl ExecutionWorker {
     }
 
     async fn cached_asset_balance(&self, asset: AssetId, token_account: &Pubkey) -> Result<u64> {
-        self.balance_cache
+        let address = if asset == AssetId::NativeSol {
+            self.signer.pubkey()
+        } else {
+            *token_account
+        };
+        // A pending batch uses its original balance minus all admitted debits.
+        // RPC refreshes cannot credit that budget until the batch is settled.
+        if let Some(amount) = self
+            .reservations
+            .lock()
+            .await
+            .remaining
+            .get(&address)
+            .copied()
+        {
+            return Ok(amount);
+        }
+        let amount = self
+            .balance_cache
             .get_or_fetch(
                 self.backend.rpc(),
                 asset,
                 self.signer.pubkey(),
                 *token_account,
             )
-            .await
+            .await?;
+        let address = if asset == AssetId::NativeSol {
+            self.signer.pubkey()
+        } else {
+            *token_account
+        };
+        Ok(self.reservations.lock().await.available(address, amount))
     }
 
     async fn asset_balance_network(&self, asset: AssetId, token_account: &Pubkey) -> Result<u64> {
@@ -842,6 +1171,7 @@ fn direct_source_mints(
     Some((info(intent.input_asset)?, info(intent.output_asset)?))
 }
 
+#[derive(Clone)]
 struct CopyTimings {
     received_at: Instant,
     database: DatabaseTimings,
@@ -1089,6 +1419,7 @@ mod timing_tests {
         let backend = Arc::new(ExecutionBackend::Mainnet(Arc::new(MainnetClient::new(
             server.url.clone(),
             &MainnetConfig {
+                fanout: Default::default(),
                 source_direct: true,
                 fixed_priority_fee_micro_lamports: None,
                 sender_url: server.url.clone(),
@@ -1172,6 +1503,7 @@ mod timing_tests {
             let backend = Arc::new(ExecutionBackend::Mainnet(Arc::new(MainnetClient::new(
                 server.url.clone(),
                 &MainnetConfig {
+                    fanout: Default::default(),
                     source_direct: false,
                     fixed_priority_fee_micro_lamports: None,
                     sender_url: server.url.clone(),
@@ -1450,6 +1782,402 @@ mod unsupported_tests {
     }
 
     #[tokio::test]
+    async fn background_settlement_overlaps_and_reservations_survive_ambiguous_results() {
+        use std::sync::atomic::AtomicBool;
+        for scenario in [
+            "overlap",
+            "limit",
+            "insufficient",
+            "send_error",
+            "signature_mismatch",
+            "timeout",
+            "failed_confirmation",
+        ] {
+            let released = Arc::new(AtomicBool::new(false));
+            let release = released.clone();
+            let sends = Arc::new(AtomicUsize::new(0));
+            let sent = sends.clone();
+            let metadata = std::sync::Mutex::new(std::collections::HashMap::new());
+            let server = TestRpc::start(move |request| match request["method"].as_str().unwrap() {
+                "getVersion" => json!({"solana-core":"3.1.0","feature-set":1}),
+                "getLatestBlockhash" => json!({"context":{"slot":42},"value":{"blockhash":Hash::new_unique().to_string(),"lastValidBlockHeight":1000}}),
+                "getBlockHeight" => json!(100),
+                // Deliberately keep reporting the pre-send balance: the reservation
+                // must protect funds even when processed RPC/cache data is stale.
+                "getBalance" => json!({"context":{"slot":42},"value":if matches!(scenario, "overlap" | "limit") {1_000_000_000} else {20_000_000}}),
+                "getAccountInfo" => json!({"context":{"slot":42},"value":mint_account()}),
+                "getMultipleAccounts" => json!({"context":{"slot":42},"value":[mint_account(),mint_account()]}),
+                "getTokenAccountBalance" => json!({"context":{"slot":43},"value":{"amount":"1000","decimals":6,"uiAmount":0.001,"uiAmountString":"0.001"}}),
+                "sendTransaction" => {
+                    let bytes = STANDARD.decode(request["params"][0].as_str().unwrap()).unwrap();
+                    let transaction: Transaction = bincode::deserialize(&bytes).unwrap();
+                    let swap = transaction.message.instructions.iter().find(|i| transaction.message.account_keys[usize::from(i.program_id_index)] == pump_fun::PROGRAM_ID).unwrap();
+                    let mint = transaction.message.account_keys[usize::from(swap.accounts[2])];
+                    metadata.lock().unwrap().insert(transaction.signatures[0].to_string(), json!({
+                        "transaction":{"message":{"accountKeys":transaction.message.account_keys.iter().map(ToString::to_string).collect::<Vec<_>>() }},
+                        "meta":{"err":null,"preTokenBalances":[],"postTokenBalances":[{"accountIndex":swap.accounts[5],"mint":mint.to_string(),"uiTokenAmount":{"amount":"1000"}}]}
+                    }));
+                    sent.fetch_add(1, Ordering::SeqCst);
+                    if scenario == "send_error" { json!({"error":{"code":-32000,"message":"ambiguous submission"}}) }
+                    else if scenario == "signature_mismatch" { json!(Signature::new_unique().to_string()) }
+                    else { json!(transaction.signatures[0].to_string()) }
+                }
+                "getSignatureStatuses" if !release.load(Ordering::SeqCst) => json!({"context":{"slot":43},"value":[null]}),
+                "getSignatureStatuses" if scenario == "failed_confirmation" => json!({"context":{"slot":43},"value":[{"slot":43,"confirmations":1,"err":{"InstructionError":[0,"InvalidArgument"]},"status":{"Err":{"InstructionError":[0,"InvalidArgument"]}},"confirmationStatus":"confirmed"}]}),
+                "getSignatureStatuses" => json!({"context":{"slot":43},"value":[{"slot":43,"confirmations":1,"err":null,"status":{"Ok":null},"confirmationStatus":"confirmed"}]}),
+                "getTransaction" => metadata.lock().unwrap().get(request["params"][0].as_str().unwrap()).unwrap().clone(),
+                method => panic!("unexpected RPC {method}"),
+            }).await;
+            let transport = HttpTransport::new(&HttpConfig::default()).unwrap();
+            let mut config = AppConfig::load(std::path::Path::new("config.example.toml")).unwrap();
+            config.sizing = SizingConfig::Fixed {
+                amount: "0.001".into(),
+            };
+            config.token_policy = TokenPolicyConfig::All {
+                minimum_input: "0.000001".into(),
+                maximum_input: "1".into(),
+            };
+            if scenario == "timeout" {
+                config.execution.confirmation_timeout_seconds = 0;
+            }
+            let mainnet = config.mainnet.as_mut().unwrap();
+            mainnet.source_direct = true;
+            mainnet.sender_url = server.url.clone();
+            let client = Arc::new(MainnetClient::new(
+                server.url.clone(),
+                mainnet,
+                transport.clone(),
+            ));
+            client.latest_blockhash().await.unwrap();
+            let store = Store::connect("sqlite::memory:").await.unwrap();
+            let wallet = config.signal.wallet;
+            let worker = ExecutionWorker::new(
+                Arc::new(config),
+                Arc::new(Keypair::new()),
+                store.clone(),
+                Arc::new(ExecutionBackend::Mainnet(client)),
+                TokenSafetyClient::new(&server.url, &transport),
+                TransactionDecoder::new(wallet),
+                Arc::new(Router::new(
+                    Arc::new(transport.solana_rpc(&server.url)),
+                    Duration::from_secs(2),
+                )),
+            );
+            let reservations = worker.reservations.clone();
+            let (sender, receiver) = tokio::sync::mpsc::channel(128);
+            for id in 1..=if scenario == "limit" { 65 } else { 2 } {
+                let observed = observation(wallet, id);
+                store.record_observation(&observed).await.unwrap();
+                sender
+                    .send(QueuedObservation {
+                        observed,
+                        received_at: Instant::now(),
+                        queued_at: Instant::now(),
+                        payload_decode_us: 0,
+                        observation_enqueue_us: 0,
+                        database_timings: DatabaseTimings::default(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            drop(sender);
+            let task = tokio::spawn(worker.run(receiver));
+            let expected_sends = match scenario {
+                "overlap" => 2,
+                "limit" => 64,
+                _ => 1,
+            };
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let rows = store.status(100).await.unwrap();
+                    let skipped = rows.iter().any(|r| r.source_status == "skipped");
+                    if sends.load(Ordering::SeqCst) == expected_sends
+                        && (matches!(scenario, "overlap" | "limit") || skipped)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("next observation must progress while confirmation is blocked");
+            if matches!(
+                scenario,
+                "overlap" | "limit" | "insufficient" | "failed_confirmation"
+            ) {
+                assert!(
+                    !task.is_finished(),
+                    "worker shutdown must drain settlement tasks"
+                );
+                assert!(
+                    store
+                        .status(10)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .all(|r| r.landed_slot.is_none())
+                );
+            }
+            released.store(true, Ordering::SeqCst);
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let expected_sends = if scenario == "limit" {
+                65
+            } else {
+                expected_sends
+            };
+            assert_eq!(sends.load(Ordering::SeqCst), expected_sends);
+            let rows = store.status(100).await.unwrap();
+            let settled = rows
+                .iter()
+                .filter(|r| r.local_signature.is_some())
+                .collect::<Vec<_>>();
+            assert_eq!(settled.len(), expected_sends);
+            for row in settled {
+                let unknown = matches!(scenario, "send_error" | "signature_mismatch" | "timeout");
+                assert_eq!(
+                    row.copy_status.as_deref(),
+                    Some(if unknown {
+                        "unknown"
+                    } else if scenario == "failed_confirmation" {
+                        "failed"
+                    } else {
+                        "landed"
+                    })
+                );
+                let timings: serde_json::Value =
+                    serde_json::from_str(row.timings_json.as_deref().unwrap()).unwrap();
+                if !unknown && scenario != "failed_confirmation" {
+                    assert!(timings["reconciliation_ms"].is_number());
+                }
+            }
+            let budget = reservations.lock().await;
+            assert_eq!(budget.pending, 0);
+            assert_eq!(
+                budget.uncertain,
+                matches!(scenario, "send_error" | "signature_mismatch" | "timeout")
+            );
+            assert_eq!(budget.remaining.is_empty(), !budget.uncertain);
+        }
+    }
+
+    #[test]
+    fn reservations_are_atomic_and_do_not_credit_unsettled_balances() {
+        let sol = Pubkey::new_unique();
+        let token = Pubkey::new_unique();
+        let mut budget = BalanceReservations::default();
+        assert!(budget.reserve(&[(sol, 100, 20), (token, 50, 30)]));
+        assert_eq!(budget.available(sol, 100), 80);
+        assert_eq!(budget.available(token, 1000), 20);
+        assert!(!budget.reserve(&[(sol, 100, 10), (token, 50, 30)]));
+        assert_eq!(
+            budget.available(sol, 100),
+            80,
+            "failed multi-account reservation cannot debit SOL"
+        );
+        assert_eq!(budget.pending, 1);
+        assert!(budget.reserve(&[(sol, 70, 10), (token, 20, 20)]));
+        assert_eq!(budget.available(sol, 100), 60);
+        assert_eq!(budget.available(token, 50), 0);
+    }
+    #[tokio::test]
+    async fn preconfirmation_copies_once_and_route_failures_allow_processed_fallback() {
+        for scenario in ["early", "route_failure", "processed_first", "fanout"] {
+            let signer = Arc::new(Keypair::new());
+            let authority = signer.pubkey();
+            let nonce_account = Pubkey::new_unique();
+            let nonce_blockhash = Hash::new_unique();
+            let landed_signature = Arc::new(std::sync::Mutex::new(String::new()));
+            let selected_signature = landed_signature.clone();
+            let landed = std::sync::Mutex::new(serde_json::Value::Null);
+            let server = TestRpc::start(move |request| match request["method"].as_str().unwrap() {
+                "getVersion" => json!({"solana-core":"3.1.0","feature-set":1}),
+                "getLatestBlockhash" => json!({"context":{"slot":42},"value":{"blockhash":Hash::new_unique().to_string(),"lastValidBlockHeight":1000}}),
+                "getBlockHeight" => json!(100),
+                "getBalance" => json!({"context":{"slot":42},"value":1_000_000_000}),
+                "getAccountInfo" => {
+                    let value = if request["params"][0] == nonce_account.to_string() {
+                        crate::mainnet::nonce::tests::nonce_value(authority, nonce_blockhash)
+                    } else { mint_account() };
+                    json!({"context":{"slot":42},"value":value})
+                },
+                "getMultipleAccounts" => {
+                    let mut native = mint_account();
+                    let mut bytes = STANDARD.decode(native["data"][0].as_str().unwrap()).unwrap();
+                    bytes[44] = 9;
+                    native["data"][0] = json!(STANDARD.encode(bytes));
+                    json!({"context":{"slot":42},"value":[native,mint_account()]})
+                },
+                "getTokenAccountBalance" => json!({"context":{"slot":43},"value":{"amount":"1000","decimals":6,"uiAmount":0.001,"uiAmountString":"0.001"}}),
+                "sendTransaction" => {
+                    let transaction: Transaction = bincode::deserialize(&STANDARD.decode(request["params"][0].as_str().unwrap()).unwrap()).unwrap();
+                    transaction.verify().unwrap();
+                    if scenario == "fanout" {
+                        assert_eq!(transaction.message.instructions[0].data,
+                            solana_system_interface::instruction::advance_nonce_account(&nonce_account, &authority).data);
+                        let price: u64 = bincode::deserialize(&transaction.message.instructions[2].data[1..]).unwrap();
+                        if price == 100000 { return json!({"error":{"code":-32000,"message":"relay rejected first variant"}}); }
+                        *selected_signature.lock().unwrap() = transaction.signatures[0].to_string();
+                    }
+                    let swap = transaction.message.instructions.iter().find(|ix| transaction.message.account_keys[ix.program_id_index as usize] == pump_fun::PROGRAM_ID).unwrap();
+                    let output_index = swap.accounts[5];
+                    let mint = transaction.message.account_keys[swap.accounts[2] as usize];
+                    *landed.lock().unwrap() = json!({"transaction":{"message":{"accountKeys":transaction.message.account_keys.iter().map(ToString::to_string).collect::<Vec<_>>() }},
+                        "meta":{"err":null,"preTokenBalances":[],"postTokenBalances":[{"accountIndex":output_index,"mint":mint.to_string(),"uiTokenAmount":{"amount":"1000"}}]}});
+                    if scenario == "fanout" { json!({"error":{"code":-32000,"message":"second variant landed but acknowledgment lost"}}) }
+                    else { json!(transaction.signatures[0].to_string()) }
+                },
+                "getTransaction" => {
+                    if scenario == "fanout" { assert_eq!(request["params"][0], *selected_signature.lock().unwrap()); }
+                    landed.lock().unwrap().clone()
+                },
+                "getSignatureStatuses" => {
+                    let status = json!({"slot":43,"confirmations":1,"err":null,"status":{"Ok":null},"confirmationStatus":"confirmed"});
+                    let statuses = request["params"][0].as_array().unwrap().iter().map(|signature|
+                        if scenario != "fanout" || signature.as_str().unwrap() == *selected_signature.lock().unwrap() { status.clone() } else { json!(null) }).collect::<Vec<_>>();
+                    json!({"context":{"slot":43},"value":statuses})
+                },
+                method => panic!("unexpected RPC {method}"),
+            }).await;
+            let transport = HttpTransport::new(&HttpConfig::default()).unwrap();
+            let mut config = AppConfig::load(std::path::Path::new("config.example.toml")).unwrap();
+            config.sizing = SizingConfig::Fixed {
+                amount: "0.001".into(),
+            };
+            config.token_policy = TokenPolicyConfig::All {
+                minimum_input: "0.000001".into(),
+                maximum_input: "1".into(),
+            };
+            let mainnet = config.mainnet.as_mut().unwrap();
+            mainnet.sender_url = server.url.clone();
+            if scenario == "fanout" {
+                mainnet.fanout.enabled = true;
+                mainnet.fanout.nonce_accounts = vec![nonce_account.to_string()];
+                mainnet.fanout.routes = (0..2)
+                    .map(|index| crate::config::FanoutRouteConfig {
+                        name: format!("route-{index}"),
+                        url: server.url.clone(),
+                        tip_account: Pubkey::new_unique().to_string(),
+                        tip_lamports: 5000,
+                        priority_fee_micro_lamports: 100000 + index,
+                    })
+                    .collect();
+            }
+            let client = Arc::new(MainnetClient::new(
+                server.url.clone(),
+                mainnet,
+                transport.clone(),
+            ));
+            client.latest_blockhash().await.unwrap();
+            let base = Store::connect("sqlite::memory:").await.unwrap();
+            if scenario == "fanout" {
+                client
+                    .nonce_pool
+                    .initialize(
+                        &client.rpc,
+                        &mainnet.fanout.nonce_accounts,
+                        authority,
+                        &base,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let (store, mut journal) = base.background_journal().await.unwrap();
+            let wallet = config.signal.wallet;
+            let worker = ExecutionWorker::new(
+                Arc::new(config),
+                signer,
+                store.clone(),
+                Arc::new(ExecutionBackend::Mainnet(client)),
+                TokenSafetyClient::new(&server.url, &transport),
+                TransactionDecoder::new(wallet),
+                Arc::new(Router::new(
+                    Arc::new(transport.solana_rpc(&server.url)),
+                    Duration::from_secs(2),
+                )),
+            );
+            let mut processed = observation(wallet, 77);
+            let VersionedMessage::Legacy(message) = &mut processed.transaction.message else {
+                unreachable!()
+            };
+            let program_index = message.instructions[0].accounts[8] as usize;
+            message.account_keys[program_index] = spl_token::id();
+            message.instructions[0].data[8..16].copy_from_slice(&5000_u64.to_le_bytes());
+            message.instructions[0].data[16..24].copy_from_slice(&10_000_000_u64.to_le_bytes());
+            let mut early = processed.clone();
+            early.origin = SignalOrigin::Preconfirmation;
+            early.meta = TransactionMeta::default();
+            if scenario == "route_failure" {
+                let VersionedMessage::Legacy(message) = &mut early.transaction.message else {
+                    unreachable!()
+                };
+                message.instructions[0].data[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+                message.instructions[0].data[16..24].copy_from_slice(&1_u64.to_le_bytes());
+            }
+            let signature = processed.signature.to_string();
+            let observations = if scenario == "processed_first" {
+                vec![processed, early.clone(), early]
+            } else {
+                vec![early.clone(), early, processed.clone(), processed]
+            };
+            let (sender, receiver) = tokio::sync::mpsc::channel(8);
+            for observed in observations {
+                store.record_observation(&observed).await.unwrap();
+                sender
+                    .send(QueuedObservation {
+                        observed,
+                        received_at: Instant::now(),
+                        queued_at: Instant::now(),
+                        payload_decode_us: 0,
+                        observation_enqueue_us: 0,
+                        database_timings: DatabaseTimings::default(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            drop(sender);
+            worker.run(receiver).await.unwrap();
+            drop(store);
+            journal.wait().await.unwrap();
+            let rows = base.status(10).await.unwrap();
+            assert_eq!(rows.len(), 1, "{scenario}");
+            assert_eq!(rows[0].signature, signature);
+            assert_eq!(
+                rows[0].copy_status.as_deref(),
+                Some("landed"),
+                "{scenario}: {:?}",
+                rows[0].error
+            );
+            assert_eq!(
+                server.count("sendTransaction"),
+                if scenario == "fanout" { 2 } else { 1 },
+                "{scenario}"
+            );
+            if scenario == "fanout" {
+                assert_eq!(
+                    rows[0].local_signature.as_deref(),
+                    Some(landed_signature.lock().unwrap().as_str())
+                );
+                assert_eq!(base.variant_signatures(&signature).await.unwrap().len(), 2);
+            }
+            let timing: serde_json::Value =
+                serde_json::from_str(rows[0].timings_json.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                timing["preconfirmation"],
+                if matches!(scenario, "early" | "fanout") {
+                    1
+                } else {
+                    0
+                },
+                "{scenario}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn unsupported_sources_do_not_send_and_next_valid_pump_copy_lands() {
         let token_reads = AtomicUsize::new(0);
         let landed_metadata = std::sync::Mutex::new(serde_json::Value::Null);
@@ -1458,6 +2186,7 @@ mod unsupported_tests {
             "getLatestBlockhash" => json!({"context":{"slot":42},"value":{"blockhash":Hash::new_unique().to_string(),"lastValidBlockHeight":1000}}),
             "getBlockHeight" => json!(100),
             "getBalance" => json!({"context":{"slot":42},"value":1_000_000_000}),
+            "getAccountInfo" => json!({"context":{"slot":42},"value":mint_account()}),
             "getMultipleAccounts" => {
                 let mut invalid = mint_account();
                 invalid["owner"] = json!(Pubkey::new_unique().to_string());
@@ -1620,7 +2349,11 @@ mod unsupported_tests {
             valid.error
         );
         assert_eq!(valid.landed_slot, Some(43));
-        assert_eq!(cache.get(&copier).await, Some(1_000_000_000));
+        assert_eq!(
+            cache.get(&copier).await,
+            None,
+            "released reservations invalidate input snapshots"
+        );
         assert_eq!(
             cache.get(&copied_output).await,
             Some(1000),
@@ -1635,5 +2368,48 @@ mod unsupported_tests {
         assert_eq!(server.count("simulateTransaction"), 0);
         assert_eq!(server.count("getProgramAccounts"), 0);
         assert_eq!(server.count("getMultipleAccounts"), 1);
+    }
+}
+
+struct PendingCopy {
+    observed: ObservedTransaction,
+    sized: SizedTrade,
+    winner: ExecutableRoute,
+    input_account: Pubkey,
+    output_account: Pubkey,
+    local_signature: solana_sdk::signature::Signature,
+    route_latency_ms: u64,
+}
+
+#[derive(Default)]
+struct BalanceReservations {
+    remaining: std::collections::HashMap<Pubkey, u64>,
+    pending: usize,
+    uncertain: bool,
+}
+
+impl BalanceReservations {
+    fn available(&self, address: Pubkey, observed: u64) -> u64 {
+        self.remaining
+            .get(&address)
+            .map_or(observed, |remaining| observed.min(*remaining))
+    }
+
+    fn can_reserve(&self, debits: &[(Pubkey, u64, u64)]) -> bool {
+        debits
+            .iter()
+            .all(|(address, observed, debit)| self.available(*address, *observed) >= *debit)
+    }
+
+    fn reserve(&mut self, debits: &[(Pubkey, u64, u64)]) -> bool {
+        if !self.can_reserve(debits) {
+            return false;
+        }
+        for (address, observed, debit) in debits {
+            self.remaining
+                .insert(*address, self.available(*address, *observed) - *debit);
+        }
+        self.pending += 1;
+        true
     }
 }

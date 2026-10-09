@@ -18,6 +18,9 @@ impl TransactionDecoder {
     }
 
     pub fn decode(&self, observed: &ObservedTransaction) -> Result<TradeIntent> {
+        if observed.origin == crate::domain::SignalOrigin::Preconfirmation {
+            return super::preconfirmation::decode(observed, self.source_wallet);
+        }
         if observed.meta.err.is_some() {
             return Err(CopyTraderError::Unsupported(
                 "source transaction failed".to_owned(),
