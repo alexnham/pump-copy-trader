@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use futures_util::{StreamExt, stream};
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -87,12 +91,37 @@ impl WalletBalanceCache {
         owner: Pubkey,
         token_account: Pubkey,
     ) -> Result<u64> {
+        self.get_or_fetch_measured(rpc, asset, owner, token_account)
+            .await
+            .map(|(amount, _, _, _)| amount)
+    }
+
+    /// Returns amount, cache hit, lock wait, and RPC-fetch elapsed microseconds.
+    pub async fn get_or_fetch_measured(
+        &self,
+        rpc: &RpcClient,
+        asset: AssetId,
+        owner: Pubkey,
+        token_account: Pubkey,
+    ) -> Result<(u64, bool, u64, u64)> {
         let address = Self::address(asset, owner, token_account);
-        self.watch(asset, owner, address).await;
-        if let Some(amount) = self.get(&address).await {
-            return Ok(amount);
+        let started = Instant::now();
+        let mut accounts = self.accounts.write().await;
+        let lock_us = started.elapsed().as_micros() as u64;
+        let account = accounts.entry(address).or_insert(WatchedAccount {
+            asset,
+            owner,
+            entry: None,
+            revision: 0,
+        });
+        let cached = account.entry.map(|entry| entry.amount);
+        drop(accounts);
+        if let Some(amount) = cached {
+            return Ok((amount, true, lock_us, 0));
         }
-        self.fetch(rpc, asset, owner, token_account).await
+        let started = Instant::now();
+        let amount = self.fetch(rpc, asset, owner, token_account).await?;
+        Ok((amount, false, lock_us, started.elapsed().as_micros() as u64))
     }
 
     /// Reconciliation reads always hit RPC and update the same cache used by execution.
@@ -272,6 +301,13 @@ mod tests {
             50
         );
         assert_eq!(server.count("getTokenAccountBalance"), 1);
+        let (amount, hit, _, fetch_us) = cache
+            .get_or_fetch_measured(&rpc, asset, owner, address)
+            .await
+            .expect("measured hit");
+        assert_eq!(amount, 50);
+        assert!(hit);
+        assert_eq!(fetch_us, 0);
         tokio::time::advance(Duration::from_secs(60)).await;
         assert_eq!(cache.get(&address).await, Some(50));
         assert_eq!(
@@ -286,8 +322,12 @@ mod tests {
         assert_eq!(cache.get(&address).await, None);
         assert_eq!(
             cache
-                .get_or_fetch(&rpc, asset, owner, address)
+                .get_or_fetch_measured(&rpc, asset, owner, address)
                 .await
+                .map(|(amount, hit, _, _)| {
+                    assert!(!hit);
+                    amount
+                })
                 .expect("invalidated refresh"),
             100
         );

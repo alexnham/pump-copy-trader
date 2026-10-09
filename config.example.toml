@@ -63,6 +63,10 @@ allow_live_mainnet = false
 slippage_bps = 100
 max_signal_age_seconds = 30
 confirmation_timeout_seconds = 30
+# Parallel preparation lanes share wallet reservations and submission limits.
+preparation_workers = 4
+# Up to this many Sender calls overlap.
+max_concurrent_sends = 32
 
 [sizing]
 # Buy sizing; token-to-SOL exits mirror the source sold fraction of our holdings.

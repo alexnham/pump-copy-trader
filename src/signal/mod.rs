@@ -28,3 +28,6 @@ pub struct QueuedObservation {
     pub observation_enqueue_us: u64,
     pub database_timings: crate::storage::DatabaseTimings,
 }
+
+#[cfg(test)]
+pub(crate) use payload::decode_update as benchmark_decode_update;

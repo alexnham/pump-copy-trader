@@ -33,6 +33,8 @@ pub struct TokenSafetyClient {
     rpc: Arc<RpcClient>,
     cache: Arc<Mutex<HashMap<Pubkey, (Instant, MintInfo)>>>,
     background: Arc<Mutex<HashMap<Pubkey, BackgroundMint>>>,
+    background_slots: Arc<tokio::sync::Semaphore>,
+    background_sweeps: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct BackgroundMint {
@@ -57,6 +59,8 @@ impl TokenSafetyClient {
         Self {
             rpc: Arc::new(transport.solana_rpc(rpc_url)),
             background: Default::default(),
+            background_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            background_sweeps: Default::default(),
             cache: Default::default(),
         }
     }
@@ -130,7 +134,22 @@ impl TokenSafetyClient {
             return Ok(native_mint_info());
         }
         let mut cache = self.background.lock().await;
-        cache.retain(|_, entry| entry.started.elapsed() < Duration::from_secs(60));
+        // Expire the requested mint immediately, and amortize whole-cache sweeps.
+        // Scanning every cached mint per source creates contention across workers.
+        if cache
+            .get(&mint)
+            .is_some_and(|entry| entry.started.elapsed() >= Duration::from_secs(60))
+        {
+            cache.remove(&mint);
+        }
+        if self
+            .background_sweeps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % 256
+            == 0
+        {
+            cache.retain(|_, entry| entry.started.elapsed() < Duration::from_secs(60));
+        }
         if let Some(entry) = cache.get(&mint) {
             return match &entry.result {
                 Some(Ok(info))
@@ -160,6 +179,11 @@ impl TokenSafetyClient {
         let client = self.clone();
         tokio::spawn(async move {
             let result = tokio::time::timeout(Duration::from_secs(10), async {
+                // A new-mint burst must not launch thousands of competing RPCs.
+                // Source evidence remains immediately available to preparation.
+                let _permit = client.background_slots.acquire().await.map_err(|_| {
+                    CopyTraderError::Execution("background mint inspection closed".into())
+                })?;
                 let account = client.rpc.get_account(&mint).await.map_err(|error| {
                     CopyTraderError::Execution(format!("failed to fetch mint {mint}: {error}"))
                 })?;
@@ -310,6 +334,87 @@ pub fn decimal_to_atomic(value: &str, decimals: u8) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn expired_background_rejections_are_not_reused_between_sweeps() {
+        use crate::{
+            config::HttpConfig,
+            test_rpc::{TestRpc, mint_account},
+        };
+        use serde_json::json;
+        let server =
+            TestRpc::start(|_| json!({"context":{"slot":42},"value":mint_account()})).await;
+        let transport = HttpTransport::new(&HttpConfig::default()).unwrap();
+        let client = TokenSafetyClient::new(&server.url, &transport);
+        let mint = Pubkey::new_unique();
+        client
+            .background_sweeps
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        client.background.lock().await.insert(
+            mint,
+            BackgroundMint {
+                started: Instant::now() - Duration::from_secs(61),
+                result: Some(Err("expired rejection".into())),
+            },
+        );
+        let info = MintInfo {
+            decimals: 6,
+            token_program: spl_token::id(),
+            has_transfer_fee: false,
+        };
+        assert_eq!(client.source_info(mint, info).await.unwrap().decimals, 6);
+        assert!(client.background.lock().await[&mint].result.is_none());
+    }
+
+    #[tokio::test]
+    async fn background_mint_bursts_share_a_bounded_rpc_pool() {
+        use crate::{
+            config::HttpConfig,
+            test_rpc::{TestRpc, mint_account},
+        };
+        use serde_json::json;
+        let server = TestRpc::start(|request| {
+            assert_eq!(request["method"], "getAccountInfo");
+            json!({"test_delay_ms":50,"test_result":{"context":{"slot":42},"value":mint_account()}})
+        })
+        .await;
+        let transport = HttpTransport::new(&HttpConfig::default()).unwrap();
+        let client = TokenSafetyClient::new(&server.url, &transport);
+        let info = MintInfo {
+            decimals: 6,
+            token_program: spl_token::id(),
+            has_transfer_fee: false,
+        };
+        for _ in 0..12 {
+            client
+                .source_info(Pubkey::new_unique(), info.clone())
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if client
+                    .background
+                    .lock()
+                    .await
+                    .values()
+                    .all(|entry| entry.result.is_some())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(server.count("getAccountInfo"), 12);
+        assert_eq!(
+            server
+                .peak_in_flight
+                .load(std::sync::atomic::Ordering::SeqCst),
+            4
+        );
+    }
 
     #[tokio::test]
     async fn source_metadata_does_not_wait_and_background_rejection_is_reused() {

@@ -309,6 +309,7 @@ async fn latency(store: &Store, limit: u32) -> Result<()> {
         "ingress_to_worker_us",
         "queue_wait_us",
         "route_wall_us",
+        "submission_wait_us",
         "sender_request_us",
     ] {
         let mut values = timings

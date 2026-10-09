@@ -198,6 +198,11 @@ pub struct ExecutionConfig {
     pub max_signal_age_seconds: u64,
     #[serde(default = "default_confirmation_timeout")]
     pub confirmation_timeout_seconds: u64,
+    /// Maximum concurrent submission calls; settlement has a separate 64-copy bound.
+    #[serde(default = "default_max_concurrent_sends")]
+    pub max_concurrent_sends: usize,
+    #[serde(default = "default_preparation_workers")]
+    pub preparation_workers: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -271,6 +276,16 @@ impl AppConfig {
         if self.signal.queue_capacity == 0 {
             return Err(CopyTraderError::Configuration(
                 "signal.queue_capacity must be greater than zero".to_owned(),
+            ));
+        }
+        if !(1..=16).contains(&self.execution.preparation_workers) {
+            return Err(CopyTraderError::Configuration(
+                "execution.preparation_workers must be between 1 and 16".into(),
+            ));
+        }
+        if !(1..=64).contains(&self.execution.max_concurrent_sends) {
+            return Err(CopyTraderError::Configuration(
+                "execution.max_concurrent_sends must be between 1 and 64".to_owned(),
             ));
         }
         if self.execution.slippage_bps > 10_000 {
@@ -628,6 +643,55 @@ const fn default_source_direct() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparation_worker_limits_and_legacy_defaults() {
+        let text = std::fs::read_to_string("config.example.toml").unwrap();
+        let legacy = text
+            .lines()
+            .filter(|line| {
+                !line.starts_with("preparation_workers =")
+                    && !line.starts_with("max_concurrent_sends =")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut config: AppConfig = toml::from_str(&legacy).unwrap();
+        assert_eq!(config.execution.preparation_workers, 4);
+        assert_eq!(config.execution.max_concurrent_sends, 8);
+        for count in [1, 4, 16] {
+            config.execution.preparation_workers = count;
+            config.validate().unwrap();
+        }
+        for count in [0, 17, usize::MAX] {
+            config.execution.preparation_workers = count;
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("preparation_workers")
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_submission_limits_are_bounded() {
+        let mut config = AppConfig::load(Path::new("config.example.toml")).unwrap();
+        for limit in [1, 8, 64] {
+            config.execution.max_concurrent_sends = limit;
+            config.validate().expect("supported concurrency");
+        }
+        for limit in [0, 65, usize::MAX] {
+            config.execution.max_concurrent_sends = limit;
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("max_concurrent_sends")
+            );
+        }
+    }
 
     #[test]
     fn sender_urls_use_environment_key_without_leaking_it_to_other_hosts() {
@@ -989,4 +1053,12 @@ mod tests {
             .is_err()
         );
     }
+}
+
+const fn default_max_concurrent_sends() -> usize {
+    8
+}
+
+const fn default_preparation_workers() -> usize {
+    4
 }

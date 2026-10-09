@@ -109,7 +109,8 @@ source trade's price rather than a fresh quote.
 
 Pump.fun and PumpSwap buys and sells reuse matching source transaction metadata,
 including Token-2022 decimals and token program IDs. Extension inspection runs in
-background; the first copy can be sent before inspection finishes. Completed
+background with a shared four-request limit; the first copy can be sent before
+inspection finishes. Completed
 inspection results apply to later copies. Missing or ambiguous source metadata
 falls back to mint RPC. Validated fallback reads are cached for 60 seconds (up to
 4096 mints). Caches reset when the trader restarts.
@@ -211,7 +212,7 @@ runtime in this service. Connections use WAL and `synchronous=FULL`.
 Live observation, cursor, intent, attempt, and outcome writes enter one ordered
 background journal queue. Submission does not wait for SQLite. An in-memory
 signature set claims attempts immediately and is seeded from persisted attempts
-at startup. The queue holds up to 4096 writes; a full or failed queue rejects
+at startup. The queue holds up to 16,384 writes; a full or failed queue rejects
 new writes rather than waiting for disk. Persistence failure stops the service.
 Startup and reconnect recovery still query SQLite.
 
@@ -223,7 +224,11 @@ tasks. Connections retain WAL and `synchronous=FULL` for completed writes.
 Decoding shares one parsed account/instruction context across its passes. Mint
 strings are decoded once per transaction, fixed program/tip addresses are constants,
 and canonical ATA derivations use an 8192-entry cache keyed by owner, mint, and
-program. Sequential trade execution is retained.
+program. `execution.preparation_workers` enables 1–16 preparation lanes (default 4).
+Each lane decodes and builds independent Pump.fun buys. Both feeds and duplicate
+observations of a signature use the same FIFO lane. Exit sizing and WSOL funding
+remain under a shared admission gate; all final fund reservations use that gate.
+Sender submission and settlement run in bounded background tasks.
 
 `payload_decode_us` measures LaserStream payload conversion; `observation_enqueue_us`
 measures observation journal enqueueing. `queue_wait_us` measures the time from
@@ -324,10 +329,24 @@ fraction of measured submissions below 1,000 µs. Missing measurements are exclu
 zero is a valid measurement. The limit selects recent source records, including
 skips and failures, so the measured sample count may be smaller. Sender response
 latency is reported separately from receipt-to-send. Existing records are retained,
-so use a recent window to compare after restart. Cache-miss RPC reads and the ordered
-worker's Sender requests can still increase latency during bursts. Background
-settlement can delay new submissions only at the 64-task limit or when reserved
-funds exhaust the available budget.
+so use a recent window to compare after restart. Cache-miss RPC reads can still
+increase latency during bursts. `execution.max_concurrent_sends` defaults to 8
+and accepts 1–64: this bounds simultaneous submission calls, independently of the
+wallet-wide 64-copy bound covering preparation, queued submissions, and settlement. A fan-out call may issue
+multiple endpoint requests. Signed bytes and route metadata are queued for the
+ordered journal before dispatch; fan-out retains its durable pre-send commit.
+Normal journal writes remain asynchronous, with a bounded 16,384-write buffer;
+this absorbs the journal backlog from the 1,000-copy benchmark but does not raise
+SQLite's sustained write throughput. Overflow still reports an error.
+
+`submission_wait_us` measures waiting for a submission permit.
+`receipt_to_send_start_us` is measured in the background task after acquiring it,
+so it includes both worker queueing and submission-slot wait. Shutdown drains
+submission and settlement tasks. Unknown responses retain reserved funds; known
+results release the batch budget only when all preparation, submission, and
+settlement are idle. `preparation_worker_id` identifies the lane in timing JSON.
+The local and example config use four workers and 32 concurrent sends; legacy
+configs without `max_concurrent_sends` keep the default of eight.
 These optimizations alone do not establish a live sub-1 ms p95 guarantee.
 
 Trade input limits stay under `[[tokens]]`. `maximum_input` caps percentage or

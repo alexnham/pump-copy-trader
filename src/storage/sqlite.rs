@@ -108,6 +108,10 @@ impl Store {
         }
     }
 
+    pub(crate) fn has_background_journal(&self) -> bool {
+        self.journal.is_some()
+    }
+
     pub(crate) async fn background_journal(&self) -> Result<(Self, super::journal::JournalWriter)> {
         let attempts: Vec<String> =
             sqlx::query_scalar("SELECT source_signature FROM copy_attempts")
