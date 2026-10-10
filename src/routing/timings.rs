@@ -17,6 +17,12 @@ impl RouteStages {
             .clone()
     }
 
+    pub(super) fn record_us(&self, name: &'static str, elapsed: std::time::Duration) {
+        let mut values = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let value = values.entry(name).or_default();
+        *value = value.saturating_add(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
+    }
+
     pub(super) fn start(&self, name: &'static str) -> StageTimer {
         StageTimer {
             stages: self.clone(),

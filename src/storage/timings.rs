@@ -36,8 +36,18 @@ impl DatabaseTimings {
         self.0
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .values()
-            .fold(0_u64, |total, timing| {
+            .iter()
+            // The parent covers these nested persistence phases; count it once.
+            .filter(|(name, _)| {
+                !matches!(
+                    **name,
+                    "fanout_journal_barrier"
+                        | "fanout_db_begin"
+                        | "fanout_db_writes"
+                        | "fanout_db_commit"
+                )
+            })
+            .fold(0_u64, |total, (_, timing)| {
                 total.saturating_add(timing.elapsed_us)
             })
     }

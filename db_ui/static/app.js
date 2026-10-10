@@ -110,7 +110,7 @@ async function loadRows(){
 function renderGrid(result,journal=false){
   if(!result.rows.length){$('grid').replaceChildren(empty('No matching records','Try another filter, search, or query.'));return;}
   const table=node('table');const head=node('thead');const header=node('tr');const body=node('tbody');
-  const columns=journal?['Trade','Status','Target','DEX','Source slot','Copy slot','Slot gap','Tx gap','Route','Received → send','Created']:result.columns;
+  const columns=journal?['Trade','Status','Target','DEX','Source slot','Copy slot','Slot gap','Tx gap','Sender route','Route','Received → send','Created']:result.columns;
   for(const name of columns){const th=node('th');if(state.view==='table'&&!journal){const button=node('button',name+(state.sort===name?(state.direction==='desc'?' ↓':' ↑'):''));button.onclick=()=>{state.direction=state.sort===name&&state.direction==='desc'?'asc':'desc';state.sort=name;state.offset=0;loadRows();};th.append(button);}else th.textContent=name;header.append(th);}
   head.append(header);table.append(head);
   result.rows.forEach((row,index)=>{
@@ -118,7 +118,7 @@ function renderGrid(result,journal=false){
     const data=Object.fromEntries(result.columns.map((column,i)=>[column,row[i]]));
     if(journal){
       const timing=parsed(data.timings_json);
-      const cells=[compact(data.source_signature),data.status,data.target,data.dex||'—',data.source_slot,data.copy_slot,data.slot_delta,data.transaction_gap,formatMs(data.route_latency_ms),formatMs(timing.receipt_to_send_start_ms),new Date(data.created_at*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})];
+      const cells=[compact(data.source_signature),data.status,data.target,data.dex||'—',data.source_slot,data.copy_slot,data.slot_delta,data.transaction_gap,data.landed_route||'—',formatMs(data.route_latency_ms),formatMs(timing.receipt_to_send_start_ms),new Date(data.created_at*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})];
       cells.forEach((value,i)=>{const td=node('td');if(i===1)td.append(badge(value));else if(i===2)td.append(node('span',value,'target'));else {td.textContent=missing(value)?'—':String(value);if([0,4,5,6].includes(i))td.className='mono'+(i===0?' signature':'');if(missing(value))td.classList.add('null');}if(i===0){td.title=data.source_signature;const side=tradeSide(data);if(side)td.append(node('span',side==='buy'?'Buy':'Sell',`badge trade-side ${side}`));}tr.append(td);});
       tr.onclick=()=>inspectTrade(data.source_signature);
     }else{
@@ -178,7 +178,7 @@ function renderTimings(timing){
     ['Submission latency','Total elapsed time before the sender request starts.',['receipt_to_send_start_us','receipt_to_send_start_ms']],
     ['Ingestion task & execution queue','Stream payload decoding and journal enqueueing run on ingestion. Queue wait delays the preparation worker pool.',['payload_decode_us','observation_enqueue_us','queue_wait_us','ingress_to_worker_us','ingestion_queue_ms']],
     ['Copy worker · before send','Work and awaited reads on the submission path. Preparation breakdowns are nested; journal enqueueing and initial reads overlap. Do not sum these with their parent totals. Balance fetch includes RPC and cache-update time; background DB commits are not included.',['pre_decode_checks_us','decode_us','preparation_ms','pre_route_preparation_us','reservation_gate_wait_us','source_mint_metadata_us','intent_journal_enqueue_us','initial_reads_us','input_ata_lookup_us','input_balance_lookup_us','input_balance_reservation_lock_wait_us','input_balance_cache_lock_wait_us','input_balance_fetch_us','position_and_sizing_us','attempt_reservation_us','mint_read_ms','cache_lookup_ms','discovery_ms','route_wall_us','route_wall_ms','route_ms','route_shared_preparation_us','route_shared_preparation_ms','route_source_pool_fetch_ms','source_route_ms','route_instruction_build_us','route_instruction_build_ms','post_route_ms','post_route_preparation_us','transaction_build_us','transaction_build_ms','transaction_sign_us','transaction_sign_ms','serialization_us','cache_invalidation_us','db_pre_send_us']],
-    ['Submission & background settlement','Sender submission, confirmation, and reconciliation run in bounded background tasks while the worker pool prepares subsequent trades. Submission-slot wait is included in receipt-to-send latency.',['submission_wait_us','sender_request_us','sender_request_ms','receipt_to_send_response_ms','post_send_journal_ms','confirmation_ms','reconciliation_ms','reconciliation_metadata_ms','db_post_send_us']],
+    ['Submission & background settlement','Sender request timing follows the landed variant’s successful acknowledgment. For shared signatures, it uses the earliest successful acknowledgment and cannot identify the delivering endpoint. Full fanout duration is separate. Confirmation and reconciliation run in background tasks.',['submission_wait_us','fanout_all_requests_us','sender_request_us','sender_request_ms','receipt_to_send_response_ms','post_send_journal_ms','confirmation_ms','reconciliation_ms','reconciliation_metadata_ms','db_post_send_us']],
     ['Checkpoints · elapsed since receipt','Cumulative timestamps, not individual stage durations.',['decode_complete_ms','source_pool_identified_ms','cache_lookup_complete_ms','quote_complete_ms','checks_complete_ms','transaction_built_ms','transaction_signed_ms','sender_request_started_ms','sender_response_received_ms']],
     ['Trade context','Values below are counts or amounts, not durations.',['slot_delta','mint_from_source','input_balance_reserved','input_balance_cache_hit','input_balance_cache_miss','cached_wsol_lamports','wrap_lamports']],
   ];
@@ -195,7 +195,7 @@ function renderTimings(timing){
   ]));
   addTimingSection('Background workers · unmeasured',background);
   const db=node('div');
-  if(typeof timing.db_total_us==='number'){seen.add('db_total_us');db.append(node('p',`Tracked database operations: ${number(timing.db_total_us)} µs. This is not a measurement of background commit time.`,'muted'));}
+  if(typeof timing.db_total_us==='number'){seen.add('db_total_us');db.append(node('p',`Tracked database operations: ${number(timing.db_total_us)} µs. Includes timed inline operations; background journal commits are excluded.`,'muted'));}
   for(const [operation,value] of Object.entries(timing.database||{})){const row=node('div',undefined,'timing-row');row.append(node('span',`DB · ${operation}`),node('strong',`${number(value.elapsed_us)} µs / ${value.calls} calls`));db.append(row);}
   if(db.childElementCount)addTimingSection('Database instrumentation',db);
   const extra=rows(Object.keys(timing).filter(key=>!seen.has(key)));

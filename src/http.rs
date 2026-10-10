@@ -25,6 +25,7 @@ pub struct HttpTransport {
 impl HttpTransport {
     pub fn new(config: &HttpConfig) -> Result<Arc<Self>> {
         let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .tcp_keepalive(Some(Duration::from_secs(config.tcp_keepalive_seconds)))
             .http2_keep_alive_interval(Some(Duration::from_secs(config.http2_keepalive_seconds)))
             .http2_keep_alive_timeout(Duration::from_secs(config.http2_keepalive_timeout_seconds))

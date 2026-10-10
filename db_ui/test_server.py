@@ -26,6 +26,25 @@ class DatabaseTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
+    def test_landed_route_migration_backfills_confirmed_variants(self):
+        with sqlite3.connect(self.path) as connection:
+            connection.execute("ALTER TABLE copy_attempts ADD COLUMN landed_slot INTEGER")
+            connection.execute("UPDATE copy_attempts SET landed_slot=101 WHERE id=1")
+            connection.execute("CREATE TABLE copy_variants(source_signature TEXT,local_signature TEXT,route_name TEXT)")
+            connection.execute("INSERT INTO copy_variants VALUES ('abc','def','newyork-nextblock')")
+            connection.execute("INSERT INTO source_transactions VALUES ('pending',102,'pump_fun','pool',1001,'{}')")
+            connection.execute("INSERT INTO copy_attempts(id,source_signature,local_signature,status,execution_target,created_at) VALUES (2,'pending','pending-signature','submitting','mainnet',1001)")
+            connection.execute("INSERT INTO copy_variants VALUES ('pending','pending-signature','ewr-swqos')")
+            migration = Path(__file__).resolve().parent.parent / 'migrations' / '0008_landed_route.sql'
+            connection.executescript(migration.read_text())
+        result = self.database.journal()
+        rows = [dict(zip(result['columns'], row)) for row in result['rows']]
+        confirmed = next(row for row in rows if row['source_signature']=='abc')
+        pending = next(row for row in rows if row['source_signature']=='pending')
+        self.assertEqual(confirmed['landed_route'], 'newyork-nextblock')
+        self.assertIsNone(pending['landed_route'])
+        self.assertEqual(self.database.trade('abc')['copy']['landed_route'], 'newyork-nextblock')
+
     def test_old_schema_browsing_and_details(self):
         catalog = self.database.catalog()
         self.assertEqual(len(catalog['tables']),2)

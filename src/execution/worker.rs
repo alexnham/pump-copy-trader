@@ -621,12 +621,14 @@ impl ExecutionWorker {
                 CopyTraderError::Execution("signed transaction has no signature".to_owned())
             })?;
         timings.mark("transaction_signed_ms");
-        timings
-            .values
-            .insert("db_pre_send_us", timings.database.total_us());
+        let fee_balance_started = Instant::now();
         let native = self
             .cached_asset_balance(AssetId::NativeSol, &self.signer.pubkey())
             .await?;
+        timings.values.insert(
+            "fee_balance_lookup_us",
+            CopyTimings::micros(fee_balance_started.elapsed()),
+        );
         let mainnet =
             self.config.mainnet.as_ref().ok_or_else(|| {
                 CopyTraderError::Execution("mainnet configuration missing".into())
@@ -677,11 +679,13 @@ impl ExecutionWorker {
         }
         if let Some(lease) = &winner.nonce {
             let mainnet = self.backend.mainnet().expect("mainnet backend");
+            let variants_started = Instant::now();
             let variants = winner
                 .variants
                 .iter()
-                .zip(&mainnet.fanout.routes)
-                .map(|(tx, route)| {
+                .zip(&winner.variant_route_indices)
+                .map(|(tx, &index)| {
+                    let route = &mainnet.fanout.routes[index];
                     Ok((
                         tx.signatures[0].to_string(),
                         bincode::serialize(tx).map_err(|e| {
@@ -693,11 +697,15 @@ impl ExecutionWorker {
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            // Arm before awaiting the commit: cancellation during a commit must
-            // conservatively keep this nonce held until a restart checks the DB.
+            timings.values.insert(
+                "fanout_variants_serialize_us",
+                CopyTimings::micros(variants_started.elapsed()),
+            );
+            // Keep the nonce held before queueing persistence or submitting.
+            // Journal writes drain in order; abrupt crashes can lose this record.
             lease.mark_submitted();
             self.store
-                .persist_fanout(
+                .enqueue_fanout(
                     &source_signature,
                     &lease.account.to_string(),
                     &lease.hash.to_string(),
@@ -797,6 +805,9 @@ impl ExecutionWorker {
             "submission_wait_us",
             CopyTimings::micros(wait_started.elapsed()),
         );
+        timings
+            .values
+            .insert("db_pre_send_us", timings.database.total_us());
         timings.stage("sender_request_ms");
         timings.mark("sender_request_started_ms");
         timings.since_receipt("receipt_to_send_start_ms");
@@ -806,20 +817,22 @@ impl ExecutionWorker {
         );
         let sender_started = Instant::now();
         let send_result = if copy.winner.nonce.is_some() {
-            self.backend
+            timings.fanout_submissions = self
+                .backend
                 .mainnet()
                 .expect("mainnet backend")
-                .send_fanout(&copy.winner.variants)
+                .send_fanout_indexed(&copy.winner.variants, &copy.winner.variant_route_indices)
                 .await;
             // Poll all locally known signatures even when every request errored.
             Ok(copy.local_signature)
         } else {
             self.backend.send(&copy.winner.transaction).await
         };
-        timings.values.insert(
-            "sender_request_us",
-            CopyTimings::micros(sender_started.elapsed()),
-        );
+        let elapsed = CopyTimings::micros(sender_started.elapsed());
+        timings.values.insert("sender_request_us", elapsed);
+        if copy.winner.nonce.is_some() {
+            timings.values.insert("fanout_all_requests_us", elapsed);
+        }
         timings.mark("sender_response_received_ms");
         timings.since_receipt("receipt_to_send_response_ms");
         timings.finish();
@@ -965,8 +978,11 @@ impl ExecutionWorker {
             Ok((signature, confirmation)) => {
                 local_signature = signature;
                 if winner.nonce.is_some() {
+                    timings.select_landed_sender(signature);
+                }
+                if winner.nonce.is_some() {
                     self.store
-                        .select_variant(&source_signature, &signature.to_string())
+                        .enqueue_selected_variant(&source_signature, &signature.to_string())
                         .await?;
                 }
                 confirmation
@@ -1041,7 +1057,9 @@ impl ExecutionWorker {
                     .variants
                     .iter()
                     .position(|tx| tx.signatures[0] == local_signature)
-                    .map_or(0, |index| mainnet.fanout.routes[index].tip_lamports)
+                    .map_or(0, |index| {
+                        mainnet.fanout.routes[winner.variant_route_indices[index]].tip_lamports
+                    })
             } else {
                 mainnet.tip_lamports()
             }
@@ -1380,15 +1398,50 @@ fn direct_source_mints(
 #[derive(Clone)]
 struct CopyTimings {
     received_at: Instant,
+    fanout_submissions: Vec<(solana_sdk::signature::Signature, u64, bool)>,
     database: DatabaseTimings,
     active: Option<(&'static str, Instant)>,
     values: std::collections::BTreeMap<&'static str, u64>,
 }
 
 impl CopyTimings {
+    fn select_landed_sender(&mut self, signature: solana_sdk::signature::Signature) {
+        // Only successful acknowledgments establish a sender response timing.
+        // Shared signatures cannot identify the physical delivery endpoint.
+        let elapsed = self
+            .fanout_submissions
+            .iter()
+            .filter(|(sig, _, accepted)| *sig == signature && *accepted)
+            .map(|(_, elapsed, _)| *elapsed)
+            .min();
+        for key in [
+            "sender_request_us",
+            "sender_request_ms",
+            "sender_response_received_ms",
+            "receipt_to_send_response_ms",
+        ] {
+            self.values.remove(key);
+        }
+        if let Some(elapsed) = elapsed {
+            self.values.insert("sender_request_us", elapsed);
+            self.values.insert("sender_request_ms", elapsed / 1000);
+            let total = self
+                .values
+                .get("receipt_to_send_start_us")
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(elapsed);
+            self.values
+                .insert("sender_response_received_ms", total / 1000);
+            self.values
+                .insert("receipt_to_send_response_ms", total / 1000);
+        }
+    }
+
     fn new(received_at: Instant) -> Self {
         let mut timings = Self {
             received_at,
+            fanout_submissions: Vec::new(),
             database: DatabaseTimings::default(),
             active: None,
             values: Default::default(),
@@ -1400,9 +1453,7 @@ impl CopyTimings {
     fn json(&self) -> Result<String> {
         let mut values = serde_json::to_value(&self.values)?;
         let database = self.database.snapshot();
-        let total_us = database.values().fold(0_u64, |total, timing| {
-            total.saturating_add(timing.elapsed_us)
-        });
+        let total_us = self.database.total_us();
         values["database"] = serde_json::to_value(database)?;
         values["db_total_us"] = total_us.into();
         if let Some(before_send) = self.values.get("db_pre_send_us") {
@@ -1440,6 +1491,23 @@ impl CopyTimings {
 
 #[cfg(test)]
 mod timing_tests {
+    #[test]
+    fn landed_sender_timing_excludes_slow_other_routes() {
+        let winner = solana_sdk::signature::Signature::new_unique();
+        let loser = solana_sdk::signature::Signature::new_unique();
+        let mut timing = super::CopyTimings::new(std::time::Instant::now());
+        timing.values.insert("receipt_to_send_start_us", 556);
+        timing.values.insert("fanout_all_requests_us", 1_502_156);
+        timing.fanout_submissions = vec![(loser, 1_502_156, false), (winner, 12_000, true)];
+        timing.select_landed_sender(winner);
+        assert_eq!(timing.values["sender_request_us"], 12_000);
+        assert_eq!(timing.values["receipt_to_send_response_ms"], 12);
+        assert_eq!(timing.values["fanout_all_requests_us"], 1_502_156);
+        timing.fanout_submissions = vec![(winner, 1_500_000, false)];
+        timing.select_landed_sender(winner);
+        assert!(!timing.values.contains_key("sender_request_us"));
+    }
+
     use super::*;
 
     #[test]
@@ -1895,6 +1963,24 @@ mod timing_tests {
     }
 
     #[test]
+    fn database_totals_do_not_double_count_nested_fanout_stages() {
+        let mut timings = CopyTimings::new(Instant::now());
+        let parent = timings.database.start("fanout_persist_total");
+        let child = timings.database.start("fanout_db_commit");
+        drop(child);
+        drop(parent);
+        let before = timings.database.total_us();
+        timings.values.insert("db_pre_send_us", before);
+        let saved: serde_json::Value = serde_json::from_str(&timings.json().unwrap()).unwrap();
+        assert_eq!(saved["db_total_us"], before);
+        assert_eq!(saved["db_post_send_us"], 0);
+        assert_eq!(
+            saved["database"]["fanout_persist_total"]["elapsed_us"],
+            before
+        );
+    }
+
+    #[test]
     fn timings_include_queue_and_failed_stage_but_omit_unreached_stages() {
         let mut timings = CopyTimings::new(Instant::now() - Duration::from_millis(50));
         timings.stage("route_ms");
@@ -2331,6 +2417,7 @@ mod unsupported_tests {
                 mainnet.fanout.nonce_accounts = vec![nonce_account.to_string()];
                 mainnet.fanout.routes = (0..2)
                     .map(|index| crate::config::FanoutRouteConfig {
+                        provider: crate::config::FanoutProvider::JsonRpc,
                         name: format!("route-{index}"),
                         url: server.url.clone(),
                         tip_account: Pubkey::new_unique().to_string(),

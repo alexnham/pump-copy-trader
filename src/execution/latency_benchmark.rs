@@ -12,12 +12,28 @@ async fn benchmark_random_laserstream_to_sender() {
         },
         solana::storage::confirmed_block as pb,
     };
+    let fanout = std::env::var_os("BENCH_FANOUT").is_some();
+    let signer = Arc::new(Keypair::new());
+    let authority = signer.pubkey();
+    let nonce_account = Pubkey::new_unique();
+    let nonce_seed = Arc::new(std::sync::Mutex::new(Hash::new_unique()));
+    let rpc_nonce = nonce_seed.clone();
     let metadata = std::sync::Mutex::new(std::collections::HashMap::new());
-    let server = TestRpc::start(move |request| match request["method"].as_str().unwrap() {
+    let winners = std::sync::Mutex::new(std::collections::HashMap::new());
+    let server = TestRpc::start(move |original| {
+        let rest = original.get("transaction").is_some();
+        let normalized;
+        let request = if rest {
+            let content = if original["transaction"].is_object() { &original["transaction"]["content"] } else { &original["transaction"] };
+            normalized = json!({"method":"sendTransaction","params":[content]});
+            &normalized
+        } else { original };
+        match request["method"].as_str().unwrap() {
         "getVersion" => json!({"solana-core":"3.1.0","feature-set":1}),
         "getLatestBlockhash" => json!({"context":{"slot":42},"value":{"blockhash":Hash::new_unique().to_string(),"lastValidBlockHeight":10000}}),
         "getBlockHeight" => json!(100),
         "getBalance" => json!({"context":{"slot":42},"value":100_000_000_000u64}),
+        "getAccountInfo" if fanout && request["params"][0].as_str() == Some(&nonce_account.to_string()) => json!({"context":{"slot":43},"value":crate::mainnet::nonce::tests::nonce_value(authority,*rpc_nonce.lock().unwrap())}),
         "getAccountInfo" => json!({"context":{"slot":42},"value":mint_account()}),
         "getMultipleAccounts" => json!({"context":{"slot":42},"value":[mint_account(),mint_account()]}),
         "getTokenAccountBalance" => json!({"context":{"slot":43},"value":{"amount":"1000000000","decimals":6,"uiAmount":0.001,"uiAmountString":"0.001"}}),
@@ -26,13 +42,26 @@ async fn benchmark_random_laserstream_to_sender() {
             let tx: Transaction = bincode::deserialize(&bytes).unwrap();
             let swap = tx.message.instructions.iter().find(|i| tx.message.account_keys[usize::from(i.program_id_index)] == pump_fun::PROGRAM_ID).unwrap();
             let mint = tx.message.account_keys[usize::from(swap.accounts[2])];
+            let mut winner_map = winners.lock().unwrap();
+            let first = !fanout || !winner_map.contains_key(&tx.message.recent_blockhash);
+            if first {
+                winner_map.insert(tx.message.recent_blockhash,tx.signatures[0]);
+                if fanout { *rpc_nonce.lock().unwrap() = Hash::new_unique(); }
             metadata.lock().unwrap().insert(tx.signatures[0].to_string(), json!({"transaction":{"message":{"accountKeys":tx.message.account_keys.iter().map(ToString::to_string).collect::<Vec<_>>() }},"meta":{"err":null,"preTokenBalances":[],"postTokenBalances":[{"accountIndex":swap.accounts[5],"mint":mint.to_string(),"uiTokenAmount":{"amount":"1000000000"}}]}}));
-            json!(tx.signatures[0].to_string())
+            }
+            if rest { json!({"test_raw_response":{"signature":tx.signatures[0].to_string()}}) }
+            else { json!(tx.signatures[0].to_string()) }
         }
-        "getSignatureStatuses" => json!({"context":{"slot":43},"value":[{"slot":43,"confirmations":1,"err":null,"status":{"Ok":null},"confirmationStatus":"confirmed"}]}),
+        "getSignatureStatuses" => {
+            let metadata = metadata.lock().unwrap();
+            let values = request["params"][0].as_array().unwrap().iter().map(|sig| {
+                if metadata.contains_key(sig.as_str().unwrap()) { json!({"slot":43,"confirmations":1,"err":null,"status":{"Ok":null},"confirmationStatus":"confirmed"}) } else { json!(null) }
+            }).collect::<Vec<_>>();
+            json!({"context":{"slot":43},"value":values})
+        },
         "getTransaction" => metadata.lock().unwrap().get(request["params"][0].as_str().unwrap()).unwrap().clone(),
         method => panic!("unexpected RPC {method}"),
-    }).await;
+    }}).await;
     let transport = HttpTransport::new(&crate::config::HttpConfig::default()).unwrap();
     let mut config = AppConfig::load(std::path::Path::new("config.example.toml")).unwrap();
     config.sizing = SizingConfig::Fixed {
@@ -53,11 +82,33 @@ async fn benchmark_random_laserstream_to_sender() {
     let mainnet = config.mainnet.as_mut().unwrap();
     mainnet.source_direct = true;
     mainnet.sender_url = server.url.clone();
-    let client = Arc::new(MainnetClient::new(
-        server.url.clone(),
-        mainnet,
-        transport.clone(),
-    ));
+    if fanout {
+        mainnet.fanout = AppConfig::load(std::path::Path::new("config.toml"))
+            .unwrap()
+            .mainnet
+            .unwrap()
+            .fanout;
+        assert_eq!(
+            mainnet.fanout.routes.len(),
+            4,
+            "benchmark expects the current four-provider routes"
+        );
+        mainnet.fanout.enabled = true;
+        mainnet.fanout.nonce_accounts = vec![nonce_account.to_string()];
+        for route in &mut mainnet.fanout.routes {
+            route.url = server.url.clone();
+            route.url.set_path(match route.provider {
+                crate::config::FanoutProvider::JsonRpc => "/",
+                crate::config::FanoutProvider::Blockrazor => "/sendTransaction",
+                crate::config::FanoutProvider::Nextblock => "/api/v2/submit",
+                crate::config::FanoutProvider::Astralane => "/iris",
+            });
+        }
+    }
+    let client = Arc::new(
+        MainnetClient::new(server.url.clone(), mainnet, transport.clone())
+            .with_mock_provider_keys(),
+    );
     client.latest_blockhash().await.unwrap();
     let refreshing = client.clone();
     let refresher = tokio::spawn(async move { refreshing.keep_blockhash_fresh().await });
@@ -68,11 +119,25 @@ async fn benchmark_random_laserstream_to_sender() {
     ))
     .await
     .unwrap();
+    if fanout {
+        client
+            .nonce_pool
+            .initialize(&client.rpc, &[nonce_account.to_string()], authority, &disk)
+            .await
+            .unwrap();
+    }
+    let nonce_client = client.clone();
+    let reader = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        dir.path().join("bench.sqlite").display()
+    ))
+    .await
+    .unwrap();
     let (store, mut journal) = disk.background_journal().await.unwrap();
     let wallet = config.signal.wallet;
     let worker = ExecutionWorker::new(
         Arc::new(config),
-        Arc::new(Keypair::new()),
+        signer,
         store.clone(),
         Arc::new(ExecutionBackend::Mainnet(client)),
         TokenSafetyClient::new(&server.url, &transport),
@@ -168,6 +233,7 @@ async fn benchmark_random_laserstream_to_sender() {
         let observed = crate::signal::benchmark_decode_update(update)
             .unwrap()
             .unwrap();
+        let source_signature = observed.signature.to_string();
         let payload_decode_us = received_at.elapsed().as_micros() as u64;
         let database_timings = DatabaseTimings::default();
         let enqueue = Instant::now();
@@ -190,6 +256,22 @@ async fn benchmark_random_laserstream_to_sender() {
         if !burst {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        if fanout {
+            // One nonce, as in the local config: wait for the prior copy's durable
+            // outcome before delivering the next synthetic receipt. This isolates
+            // per-copy cost; it is not a 200 TPS or burst-capacity claim.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let saved: Option<Option<String>> = sqlx::query_scalar("SELECT s.timings_json FROM source_transactions s JOIN copy_attempts a ON a.source_signature=s.signature WHERE s.signature=? AND a.status='landed'").bind(&source_signature).fetch_optional(&reader).await.unwrap();
+                    if matches!(saved,Some(Some(_))) { break; }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }).await.unwrap();
+            nonce_client
+                .nonce_pool
+                .refresh(&nonce_client.rpc, authority)
+                .await;
+        }
     }
     drop(sender);
     tokio::time::timeout(Duration::from_secs(120), task)
@@ -198,6 +280,7 @@ async fn benchmark_random_laserstream_to_sender() {
         .unwrap()
         .unwrap();
     drop(store);
+    reader.close().await;
     journal.wait().await.unwrap();
     refresher.abort();
     let rows = disk.status(1000).await.unwrap();
@@ -208,7 +291,14 @@ async fn benchmark_random_laserstream_to_sender() {
             .or_insert(0) += 1;
     }
     println!("outcomes={outcomes:?}");
-    assert_eq!(server.count("sendTransaction"), 1000);
+    let send_count = server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r["method"] == "sendTransaction" || r.get("transaction").is_some())
+        .count();
+    assert_eq!(send_count, if fanout { 4000 } else { 1000 });
     assert_eq!(rows.len(), 1000);
     assert!(
         rows.iter()
@@ -225,7 +315,13 @@ async fn benchmark_random_laserstream_to_sender() {
         .map(|t| t["preparation_worker_id"].as_u64().unwrap())
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(used_workers.len(), worker_count);
-    let mode = if burst { "burst" } else { "paced" };
+    let mode = if fanout {
+        "fanout-isolated"
+    } else if burst {
+        "burst"
+    } else {
+        "paced"
+    };
     std::fs::create_dir_all("benchmark-results").unwrap();
     std::fs::write(
         format!("benchmark-results/laserstream-sender-{mode}-concurrent-{send_limit}-workers-{worker_count}.json"),
@@ -234,7 +330,7 @@ async fn benchmark_random_laserstream_to_sender() {
     .unwrap();
     println!(
         "mode={mode}, workers={worker_count}, concurrency={send_limit}, sends={}, samples={}",
-        server.count("sendTransaction"),
+        send_count,
         samples.len()
     );
     for key in [
@@ -249,6 +345,15 @@ async fn benchmark_random_laserstream_to_sender() {
         "transaction_build_us",
         "transaction_sign_us",
         "sender_request_us",
+        "fee_balance_lookup_us",
+        "fanout_variants_serialize_us",
+        "signing_only_us",
+        "variant_build_us",
+        "variant_size_checks_us",
+        "variant_0_sign_us",
+        "variant_1_sign_us",
+        "variant_2_sign_us",
+        "variant_3_sign_us",
     ] {
         let mut v = samples
             .iter()
@@ -265,6 +370,19 @@ async fn benchmark_random_laserstream_to_sender() {
                 v[(v.len() * 99).div_ceil(100) - 1],
                 v[v.len() - 1],
                 v.iter().sum::<u64>() as f64 / v.len() as f64
+            );
+        }
+    }
+    if fanout {
+        for sample in &samples {
+            assert_eq!(sample["db_pre_send_us"], 0);
+            assert_eq!(sample["db_post_send_us"], 0);
+            assert!(sample["database"].get("fanout_persist_total").is_none());
+        }
+        for row in &rows {
+            assert_eq!(
+                disk.variant_signatures(&row.signature).await.unwrap().len(),
+                4
             );
         }
     }

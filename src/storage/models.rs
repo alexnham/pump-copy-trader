@@ -9,6 +9,7 @@ pub struct StatusRow {
     pub copy_status: Option<String>,
     pub local_signature: Option<String>,
     pub landed_slot: Option<i64>,
+    pub landed_route: Option<String>,
     pub error: Option<String>,
     pub timings_json: Option<String>,
 }

@@ -135,3 +135,9 @@ Each run used 1,000 transactions and 32 send slots. All copies landed in the moc
 | Burst | 4 | 55.708 ms | 65.562 ms | 67.226 ms |
 | Burst | 8 | 62.472 ms | 69.146 ms | 71.919 ms |
 | Burst | 16 | 64.763 ms | 75.456 ms | 78.318 ms |
+
+## Detailed four-route baseline
+
+See [fanout-baseline.md](fanout-baseline.md) for the instrumented four-route,
+one-nonce baseline and its limitations. The recorded run contains 1,000 landed
+mock copies, 4,000 submissions, and four durably stored variants per copy.

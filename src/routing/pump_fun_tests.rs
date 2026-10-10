@@ -53,12 +53,38 @@ fn pump_fun_buy_rewrites_wallet_output_and_buy_arguments() {
         swap.accounts[5].pubkey,
         associated_token_address(&copier, &mint, &spl_token::id())
     );
-    assert_eq!(u64::from_le_bytes(swap.data[8..16].try_into().unwrap()), 55);
+    assert_eq!(u64::from_le_bytes(swap.data[8..16].try_into().unwrap()), 50);
     assert_eq!(
         u64::from_le_bytes(swap.data[16..24].try_into().unwrap()),
         100
     );
     assert_eq!(route.pool, curve);
+    // A 50% slippage allowance changes requested tokens, never the spend cap.
+    let (expected, minimum) = super::source_outputs(&trade, 5000).unwrap();
+    let adjusted = copy_source_instruction(&source, &trade, copier, expected, minimum).unwrap();
+    let buy = adjusted
+        .instructions
+        .iter()
+        .find(|ix| ix.program_id == PROGRAM_ID)
+        .unwrap();
+    assert_eq!(u64::from_le_bytes(buy.data[8..16].try_into().unwrap()), 100);
+    assert_eq!(
+        u64::from_le_bytes(buy.data[16..24].try_into().unwrap()),
+        100
+    );
+    // With zero slippage, the original expected token amount is requested.
+    let (expected, minimum) = super::source_outputs(&trade, 0).unwrap();
+    let unchanged = copy_source_instruction(&source, &trade, copier, expected, minimum).unwrap();
+    let buy = unchanged
+        .instructions
+        .iter()
+        .find(|ix| ix.program_id == PROGRAM_ID)
+        .unwrap();
+    assert_eq!(u64::from_le_bytes(buy.data[8..16].try_into().unwrap()), 200);
+    assert_eq!(
+        u64::from_le_bytes(buy.data[16..24].try_into().unwrap()),
+        100
+    );
 }
 
 #[test]
@@ -274,5 +300,82 @@ fn pump_fun_sell_v2_creates_copier_quote_ata_for_token_quote() {
     assert_eq!(
         sell.accounts[20].pubkey,
         associated_token_address(&volume, &quote_mint, &spl_token::id())
+    );
+}
+
+#[test]
+fn recorded_legacy_buy_rewrites_volume_pda_for_the_copier() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/pump_fun_legacy_buy_volume.json"
+    ))
+    .unwrap();
+    let key = |name: &str| fixture[name].as_str().unwrap().parse::<Pubkey>().unwrap();
+    let source_wallet = key("source_wallet");
+    let copier = key("copier");
+    let mint = key("mint");
+    let accounts = fixture["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| AccountMeta {
+            pubkey: a["pubkey"].as_str().unwrap().parse().unwrap(),
+            is_signer: a["signer"].as_bool().unwrap(),
+            is_writable: a["writable"].as_bool().unwrap(),
+        })
+        .collect::<Vec<_>>();
+    let source = SourceInstruction {
+        instruction: Instruction {
+            program_id: PROGRAM_ID,
+            accounts: accounts.clone(),
+            data: bs58::decode(fixture["data"].as_str().unwrap())
+                .into_vec()
+                .unwrap(),
+        },
+        source_wallet,
+        wallet_token_accounts: vec![(accounts[5].pubkey, mint, spl_token_2022::id())],
+    };
+    assert_eq!(
+        crate::token::accounts::user_volume_address(&PROGRAM_ID, &source_wallet),
+        key("source_volume")
+    );
+    assert_eq!(
+        crate::token::accounts::user_volume_address(&PROGRAM_ID, &copier),
+        key("copier_volume")
+    );
+    let trade = SizedTrade {
+        intent: TradeIntent {
+            source_pool: None,
+            source_instruction: Some(source.clone()),
+            source_signature: Default::default(),
+            slot: 454960830,
+            input_asset: AssetId::NativeSol,
+            output_asset: AssetId::Token(mint),
+            source_input_amount: 1040225003,
+            source_output_amount: 31185032285426,
+        },
+        input_amount: 30000000,
+    };
+    let route =
+        copy_source_instruction(&source, &trade, copier, 899373660376, 449686830188).unwrap();
+    let swap = route
+        .instructions
+        .iter()
+        .find(|ix| ix.program_id == PROGRAM_ID)
+        .unwrap();
+    assert_eq!(swap.accounts.len(), 18);
+    assert_eq!(swap.accounts[13].pubkey, key("copier_volume"));
+    assert_eq!(swap.accounts[6].pubkey, copier);
+    assert_eq!(
+        swap.accounts[5].pubkey,
+        associated_token_address(&copier, &mint, &spl_token_2022::id())
+    );
+    for index in [0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17] {
+        assert_eq!(swap.accounts[index], accounts[index]);
+    }
+    assert!(
+        !swap
+            .accounts
+            .iter()
+            .any(|a| a.pubkey == key("source_volume"))
     );
 }
