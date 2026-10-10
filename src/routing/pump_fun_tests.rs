@@ -379,3 +379,40 @@ fn recorded_legacy_buy_rewrites_volume_pda_for_the_copier() {
             .any(|a| a.pubkey == key("source_volume"))
     );
 }
+
+#[test]
+fn native_sol_delta_cannot_fund_arbitrary_v2_quote_tokens() {
+    let source_wallet = Pubkey::new_unique();
+    let mint = Pubkey::new_unique();
+    let mut data = vec![0; 24];
+    data[..8].copy_from_slice(&BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR);
+    let mut accounts = (0..27)
+        .map(|_| AccountMeta::new(Pubkey::new_unique(), false))
+        .collect::<Vec<_>>();
+    accounts[1].pubkey = mint;
+    accounts[2].pubkey = Pubkey::from_str_const("8TiMkgvsrat9tM2esko8zVTt99LZLpefUM4SnZaziXaQ");
+    let source = SourceInstruction {
+        instruction: Instruction {
+            program_id: PROGRAM_ID,
+            accounts,
+            data,
+        },
+        source_wallet,
+        wallet_token_accounts: vec![],
+    };
+    let trade = SizedTrade {
+        intent: TradeIntent {
+            source_pool: None,
+            source_instruction: Some(source.clone()),
+            source_signature: Default::default(),
+            slot: 1,
+            input_asset: AssetId::NativeSol,
+            output_asset: AssetId::Token(mint),
+            source_input_amount: 1_000_000_000,
+            source_output_amount: 1000,
+        },
+        input_amount: 30_000_000,
+    };
+    let error = copy_source_instruction(&source, &trade, Pubkey::new_unique(), 30, 15).unwrap_err();
+    assert!(error.to_string().contains("funding conversion"));
+}
