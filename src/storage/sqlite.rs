@@ -38,6 +38,48 @@ impl Store {
             > 0)
     }
 
+    /// Queue fanout persistence in journal order without waiting for SQLite.
+    /// Abrupt shutdown can lose queued nonce/variant records after submission.
+    pub async fn enqueue_fanout(
+        &self,
+        source: &str,
+        account: &str,
+        nonce: &str,
+        variants: &[(String, Vec<u8>, String)],
+        simulation: &str,
+    ) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            let store = self.persistence_store();
+            let source_owned = source.to_owned();
+            let account = account.to_owned();
+            let nonce = nonce.to_owned();
+            let variants = variants.to_vec();
+            let simulation = simulation.to_owned();
+            journal.submitted(source)?;
+            journal.enqueue(Box::pin(async move {
+                store
+                    .persist_fanout(&source_owned, &account, &nonce, &variants, &simulation)
+                    .await
+            }))?;
+            return Ok(());
+        }
+        self.persist_fanout(source, account, nonce, variants, simulation)
+            .await
+    }
+
+    pub async fn enqueue_selected_variant(&self, source: &str, signature: &str) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            let store = self.persistence_store();
+            let source = source.to_owned();
+            let signature = signature.to_owned();
+            journal.enqueue(Box::pin(async move {
+                store.select_variant(&source, &signature).await
+            }))?;
+            return Ok(());
+        }
+        self.select_variant(source, signature).await
+    }
+
     /// Wait for earlier observation/admission writes before committing fan-out.
     pub async fn persist_fanout(
         &self,
@@ -47,7 +89,15 @@ impl Store {
         variants: &[(String, Vec<u8>, String)],
         simulation: &str,
     ) -> Result<()> {
+        let _total = self
+            .timings
+            .as_ref()
+            .map(|t| t.start("fanout_persist_total"));
         if let Some(journal) = &self.journal {
+            let _barrier = self
+                .timings
+                .as_ref()
+                .map(|t| t.start("fanout_journal_barrier"));
             let (tx, rx) = tokio::sync::oneshot::channel();
             journal.enqueue(Box::pin(async move {
                 let _ = tx.send(());
@@ -59,7 +109,10 @@ impl Store {
         let first = variants
             .first()
             .ok_or_else(|| CopyTraderError::Storage("empty fanout".into()))?;
+        let begin = self.timings.as_ref().map(|t| t.start("fanout_db_begin"));
         let mut tx = self.pool.begin().await?;
+        drop(begin);
+        let writes = self.timings.as_ref().map(|t| t.start("fanout_db_writes"));
         sqlx::query("INSERT INTO nonce_uses(account,nonce,source_signature) VALUES(?,?,?)")
             .bind(account)
             .bind(nonce)
@@ -77,7 +130,10 @@ impl Store {
                 "fanout attempt was not prepared".into(),
             ));
         }
+        drop(writes);
+        let commit = self.timings.as_ref().map(|t| t.start("fanout_db_commit"));
         tx.commit().await?;
+        drop(commit);
         if let Some(journal) = &self.journal {
             journal.submitted(source)?;
         }
@@ -95,8 +151,8 @@ impl Store {
         )
     }
     pub async fn select_variant(&self, source: &str, signature: &str) -> Result<()> {
-        sqlx::query("UPDATE copy_attempts SET local_signature=?, signed_transaction=(SELECT signed_transaction FROM copy_variants WHERE source_signature=? AND local_signature=?) WHERE source_signature=? AND EXISTS(SELECT 1 FROM copy_variants WHERE source_signature=? AND local_signature=?)")
-            .bind(signature).bind(source).bind(signature).bind(source).bind(source).bind(signature).execute(&self.pool).await?;
+        sqlx::query("UPDATE copy_attempts SET local_signature=?, signed_transaction=(SELECT signed_transaction FROM copy_variants WHERE source_signature=? AND local_signature=?), landed_route=(SELECT route_name FROM copy_variants WHERE source_signature=? AND local_signature=?) WHERE source_signature=? AND EXISTS(SELECT 1 FROM copy_variants WHERE source_signature=? AND local_signature=?)")
+            .bind(signature).bind(source).bind(signature).bind(source).bind(signature).bind(source).bind(source).bind(signature).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -106,6 +162,10 @@ impl Store {
             timings: None,
             journal: None,
         }
+    }
+
+    pub(crate) fn has_background_journal(&self) -> bool {
+        self.journal.is_some()
     }
 
     pub(crate) async fn background_journal(&self) -> Result<(Self, super::journal::JournalWriter)> {
@@ -838,6 +898,7 @@ impl Store {
                 a.status AS copy_status,
                 a.local_signature,
                 a.landed_slot,
+                a.landed_route,
                 COALESCE(a.error, s.skip_reason) AS error,
                 s.timings_json
             FROM source_transactions s
@@ -1135,8 +1196,59 @@ mod background_tests {
 mod fanout_tests {
     use super::*;
     #[tokio::test]
+    async fn queued_fanout_does_not_wait_for_writer_and_selection_stays_ordered() {
+        let base = Store::connect("sqlite::memory:").await.unwrap();
+        let (store, mut writer) = base.background_journal().await.unwrap();
+        let (release, blocked) = tokio::sync::oneshot::channel::<()>();
+        store
+            .journal
+            .as_ref()
+            .unwrap()
+            .enqueue(Box::pin(async move {
+                blocked.await.unwrap();
+                Ok(())
+            }))
+            .unwrap();
+        store
+            .record_recovered_signature("queued", 42)
+            .await
+            .unwrap();
+        store
+            .reserve_attempt("queued", ExecutionTarget::Mainnet, 10, 9)
+            .await
+            .unwrap();
+        let variants = vec![
+            ("first".into(), vec![1], "first-route".into()),
+            ("winner".into(), vec![2], "winner-route".into()),
+        ];
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            store.enqueue_fanout("queued", "account", "nonce", &variants, "{}"),
+        )
+        .await
+        .expect("must not wait for blocked writer")
+        .unwrap();
+        store
+            .enqueue_selected_variant("queued", "winner")
+            .await
+            .unwrap();
+        store.record_landed_slot("queued", 43).await.unwrap();
+        assert!(!base.nonce_was_used("account", "nonce").await.unwrap());
+        release.send(()).unwrap();
+        drop(store);
+        writer.wait().await.unwrap();
+        assert!(base.nonce_was_used("account", "nonce").await.unwrap());
+        let selected: (String, String, i64) = sqlx::query_as(
+            "SELECT local_signature,landed_route,landed_slot FROM copy_attempts WHERE source_signature='queued'")
+            .fetch_one(&base.pool).await.unwrap();
+        assert_eq!(selected, ("winner".into(), "winner-route".into(), 43));
+    }
+
+    #[tokio::test]
     async fn fanout_commit_is_atomic_and_nonce_reuse_is_rejected() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
+        let metrics = super::super::DatabaseTimings::default();
+        let store = store.with_timings(metrics.clone());
         let (journal, mut writer) = store.background_journal().await.unwrap();
         journal
             .record_recovered_signature("first", 42)
@@ -1155,11 +1267,37 @@ mod fanout_tests {
             .persist_fanout("first", "account", "nonce", &variants, "{}")
             .await
             .unwrap();
+        let measured = metrics.snapshot();
+        for key in [
+            "fanout_persist_total",
+            "fanout_journal_barrier",
+            "fanout_db_begin",
+            "fanout_db_writes",
+            "fanout_db_commit",
+        ] {
+            assert_eq!(measured[key].calls, 1);
+        }
+        assert!(
+            measured["fanout_persist_total"].elapsed_us >= measured["fanout_db_commit"].elapsed_us
+        );
+        assert_eq!(
+            metrics.total_us(),
+            measured["fanout_persist_total"].elapsed_us
+        );
         assert!(store.nonce_was_used("account", "nonce").await.unwrap());
         assert_eq!(store.variant_signatures("first").await.unwrap().len(), 2);
         store.select_variant("first", "b").await.unwrap();
         let row: (String, Vec<u8>) = sqlx::query_as("SELECT local_signature,signed_transaction FROM copy_attempts WHERE source_signature='first'").fetch_one(&store.pool).await.unwrap();
         assert_eq!(row, ("b".into(), vec![2]));
+        assert_eq!(
+            store.status(1).await.unwrap()[0].landed_route.as_deref(),
+            Some("route-b")
+        );
+        store.select_variant("first", "not-recorded").await.unwrap();
+        assert_eq!(
+            store.status(1).await.unwrap()[0].landed_route.as_deref(),
+            Some("route-b")
+        );
         store
             .record_recovered_signature("second", 43)
             .await

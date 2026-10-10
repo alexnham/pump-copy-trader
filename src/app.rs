@@ -309,6 +309,11 @@ async fn latency(store: &Store, limit: u32) -> Result<()> {
         "ingress_to_worker_us",
         "queue_wait_us",
         "route_wall_us",
+        "signing_only_us",
+        "variant_build_us",
+        "variant_size_checks_us",
+        "fee_balance_lookup_us",
+        "submission_wait_us",
         "sender_request_us",
     ] {
         let mut values = timings
@@ -344,7 +349,7 @@ async fn latency(store: &Store, limit: u32) -> Result<()> {
 async fn status(store: &Store, limit: u32) -> Result<()> {
     for row in store.status(limit).await? {
         println!(
-            "source_slot={} copy_slot={} slot_delta={} source={} signature={} dex={} pool={} target={} copy={} local={} error={} timings={}",
+            "source_slot={} copy_slot={} slot_delta={} source={} signature={} dex={} pool={} target={} copy={} local={} landed_route={} error={} timings={}",
             row.slot,
             row.landed_slot
                 .map(|slot| slot.to_string())
@@ -359,6 +364,7 @@ async fn status(store: &Store, limit: u32) -> Result<()> {
             row.execution_target.as_deref().unwrap_or("-"),
             row.copy_status.as_deref().unwrap_or("-"),
             row.local_signature.as_deref().unwrap_or("-"),
+            row.landed_route.as_deref().unwrap_or("-"),
             row.error.as_deref().unwrap_or("-"),
             row.timings_json.as_deref().unwrap_or("-")
         );

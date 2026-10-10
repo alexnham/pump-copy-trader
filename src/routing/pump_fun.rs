@@ -151,7 +151,9 @@ pub(crate) fn copy_source_instruction(
     let (first, second) = if is_exact_quote_in(&data) {
         (trade.input_amount, minimum_output)
     } else {
-        (expected_output, trade.input_amount)
+        // Exact-output buys must reduce the requested tokens to honor
+        // slippage without increasing the configured SOL spending cap.
+        (minimum_output, trade.input_amount)
     };
     data[8..16].copy_from_slice(&first.to_le_bytes());
     data[16..24].copy_from_slice(&second.to_le_bytes());
@@ -165,6 +167,16 @@ pub(crate) fn copy_source_instruction(
             .find(|(address, _, _)| *address == meta.pubkey)
         {
             meta.pubkey = associated_token_address(&copier, mint, token_program);
+        }
+    }
+    // Legacy buys can also carry the wallet-derived volume accumulator among
+    // their trailing accounts. Preserve layout/order and remap it by identity.
+    let source_volume =
+        crate::token::accounts::user_volume_address(&PROGRAM_ID, &source.source_wallet);
+    let copier_volume = crate::token::accounts::user_volume_address(&PROGRAM_ID, &copier);
+    for meta in &mut accounts {
+        if meta.pubkey == source_volume {
+            meta.pubkey = copier_volume;
         }
     }
     let discriminator: [u8; 8] = data[..8].try_into().map_err(|_| {

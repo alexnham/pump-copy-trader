@@ -28,6 +28,7 @@ cargo run -- --config config.toml run
 `status` opens and migrates SQLite without requiring a signer or network access.
 `COPY_TRADER_CONFIG` remains an alternative to `--config`.
 
+
 `[signal.preconfirmations]` is enabled by default and subscribes to Helius
 `preconfSubscribe` at `wss://beta.helius-rpc.com/`, using `HELIUS_API_KEY`. Set
 `enabled = false` to use LaserStream alone. `doctor` checks the subscription when
@@ -109,7 +110,8 @@ source trade's price rather than a fresh quote.
 
 Pump.fun and PumpSwap buys and sells reuse matching source transaction metadata,
 including Token-2022 decimals and token program IDs. Extension inspection runs in
-background; the first copy can be sent before inspection finishes. Completed
+background with a shared four-request limit; the first copy can be sent before
+inspection finishes. Completed
 inspection results apply to later copies. Missing or ambiguous source metadata
 falls back to mint RPC. Validated fallback reads are cached for 60 seconds (up to
 4096 mints). Caches reset when the trader restarts.
@@ -211,7 +213,7 @@ runtime in this service. Connections use WAL and `synchronous=FULL`.
 Live observation, cursor, intent, attempt, and outcome writes enter one ordered
 background journal queue. Submission does not wait for SQLite. An in-memory
 signature set claims attempts immediately and is seeded from persisted attempts
-at startup. The queue holds up to 4096 writes; a full or failed queue rejects
+at startup. The queue holds up to 16,384 writes; a full or failed queue rejects
 new writes rather than waiting for disk. Persistence failure stops the service.
 Startup and reconnect recovery still query SQLite.
 
@@ -223,7 +225,11 @@ tasks. Connections retain WAL and `synchronous=FULL` for completed writes.
 Decoding shares one parsed account/instruction context across its passes. Mint
 strings are decoded once per transaction, fixed program/tip addresses are constants,
 and canonical ATA derivations use an 8192-entry cache keyed by owner, mint, and
-program. Sequential trade execution is retained.
+program. `execution.preparation_workers` enables 1–16 preparation lanes (default 4).
+Each lane decodes and builds independent Pump.fun buys. Both feeds and duplicate
+observations of a signature use the same FIFO lane. Exit sizing and WSOL funding
+remain under a shared admission gate; all final fund reservations use that gate.
+Sender submission and settlement run in bounded background tasks.
 
 `payload_decode_us` measures LaserStream payload conversion; `observation_enqueue_us`
 measures observation journal enqueueing. `queue_wait_us` measures the time from
@@ -324,10 +330,24 @@ fraction of measured submissions below 1,000 µs. Missing measurements are exclu
 zero is a valid measurement. The limit selects recent source records, including
 skips and failures, so the measured sample count may be smaller. Sender response
 latency is reported separately from receipt-to-send. Existing records are retained,
-so use a recent window to compare after restart. Cache-miss RPC reads and the ordered
-worker's Sender requests can still increase latency during bursts. Background
-settlement can delay new submissions only at the 64-task limit or when reserved
-funds exhaust the available budget.
+so use a recent window to compare after restart. Cache-miss RPC reads can still
+increase latency during bursts. `execution.max_concurrent_sends` defaults to 8
+and accepts 1–64: this bounds simultaneous submission calls, independently of the
+wallet-wide 64-copy bound covering preparation, queued submissions, and settlement. A fan-out call may issue
+multiple endpoint requests. Signed bytes and route metadata are queued for the
+ordered journal before dispatch; fan-out persistence is queued on the same writer.
+Normal journal writes remain asynchronous, with a bounded 16,384-write buffer;
+this absorbs the journal backlog from the 1,000-copy benchmark but does not raise
+SQLite's sustained write throughput. Overflow still reports an error.
+
+`submission_wait_us` measures waiting for a submission permit.
+`receipt_to_send_start_us` is measured in the background task after acquiring it,
+so it includes both worker queueing and submission-slot wait. Shutdown drains
+submission and settlement tasks. Unknown responses retain reserved funds; known
+results release the batch budget only when all preparation, submission, and
+settlement are idle. `preparation_worker_id` identifies the lane in timing JSON.
+The local and example config use four workers and 32 concurrent sends; legacy
+configs without `max_concurrent_sends` keep the default of eight.
 These optimizations alone do not establish a live sub-1 ms p95 guarantee.
 
 Trade input limits stay under `[[tokens]]`. `maximum_input` caps percentage or
@@ -416,15 +436,15 @@ pool for this trader and the same durable SQLite database across restarts.
 
 Preparation reserves a cached nonce, places `AdvanceNonceAccount` first, and
 signs one variant per route. All variants execute the same swap but may have
-different fees/tips. The journal waits for earlier writes and atomically stores
-all variants plus the nonce use **before any submission**. This adds a durable
-SQLite write to send-start latency. Submission requests run concurrently and
+different fees/tips. The ordered background journal atomically stores all
+variants plus the nonce use, without blocking submission on the commit.
+Submission requests run concurrently and
 settlement polls all signatures, including after every route reports an error.
 The actual confirmed signature replaces the initial journal signature for
 balance reconciliation and slot tracking. Fee reservations cover the maximum
 configured route tip and priority fee.
 
-Unsent preparation releases its lease. Once journal commitment begins, the
+Unsent preparation releases its lease. Once persistence is queued, the
 nonce remains held until a finalized read proves advancement; request errors,
 confirmation timeouts, and dropped tasks never free it. Pool exhaustion fails
 preparation without sending. Nonces do not expire: an unresolved transaction
@@ -435,3 +455,119 @@ that check. Resolve the signature history/on-chain outcome before restarting;
 there is no automatic cancellation or retry with a fresh nonce.
 
 Nonce rules follow the [Solana durable nonce documentation](https://solana.com/docs/core/transactions/durable-nonces).
+
+### BlockRazor fan-out route
+
+Set `BLOCKRAZOR_API_KEY` in the environment or `.env`, and add the BlockRazor
+route shown in `config.example.toml` to the enabled nonce fan-out. Existing routes
+default to `provider = "json_rpc"`; BlockRazor uses `provider = "blockrazor"`.
+Its HTTP endpoint receives a direct JSON payload with base64 signed bytes,
+`mode = "fast"`, `safeWindow = 5`, and `revertProtection = false`, authenticated
+with a sensitive `apikey` header. Keys are never added to route URLs or the journal.
+Official BlockRazor Solana endpoints and tip accounts are validated. Submission
+uses the existing fan-out timeout and shared-nonce winner tracking; even failed
+acknowledgements remain eligible for on-chain settlement. Authenticated `/health`
+requests warm the connection at startup and every 30 seconds. HTTP redirects are
+rejected so authenticated requests cannot be redirected to other hosts.
+
+The local configuration adds New York HTTPS alongside the two Helius routes,
+with a 100,000-lamport tip and the same 100,000 micro-lamport priority fee.
+BlockRazor documents a default 3 TPS submission limit; higher throughput needs
+an approved limit. This integration does not restart or submit live trades.
+
+Protocol reference: https://docs.blockrazor.io/transaction-submission/transaction-sending/solana/send-transaction/request-example/rust
+
+### NextBlock fan-out route
+
+Set `NEXTBLOCK_API_KEY` in the environment or `.env`. A route with
+`provider = "nextblock"` submits to `/api/v2/submit` using an Authorization
+header containing the raw API key (no Bearer prefix). The body carries
+`transaction.content` as base64 signed bytes, `skipPreFlight = true`,
+`disableRetries = true`, and the protection/snipe flags disabled. It retains
+shared-nonce fan-out signing, bounded submission timeout, acknowledgement-signature
+validation, and on-chain winner tracking. `/api/v2/tipfloor` warms the connection.
+Credentials are sensitive headers, excluded from config/URLs/journal, and redirects
+are rejected. Enabled NextBlock routes require the environment key at startup.
+
+The local configuration adds the New York endpoint with a 1,000,000-lamport tip
+and 100,000 micro-lamports/CU priority fee. This stays within the existing largest
+route tip budget. One region is configured to conserve submission quota. Other
+available hostnames: frankfurt, amsterdam, london, singapore, tokyo, slc, dublin,
+and vilnius, each under `nextblock.io`. Restart the rebuilt trader to apply it.
+
+Reference: https://docs.nextblock.io/api/submit-transaction
+
+Fan-out confirmation stores the confirmed variant's `route_name` as
+`copy_attempts.landed_route`, alongside its signature. The status command and DB
+UI expose it. The migration backfills previously confirmed matching variants;
+unconfirmed and ordinary single-sender attempts retain NULL. This identifies
+the winning signed variant, not the physical relay when identical signed bytes
+were sent through multiple endpoints.
+
+Validation for route attribution: 140 Rust tests and 17 DB UI tests passed,
+including confirmed-route selection, unknown-signature rejection, historical
+backfill, and unresolved-record NULL handling.
+
+### Detailed nonce fan-out latency
+
+Timing JSON includes `variant_N_build_us` and `variant_N_sign_us` for each route
+index N, plus summed `variant_build_us`, `signing_only_us`, and
+`variant_size_checks_us`. The existing `transaction_sign_us` remains a combined
+stage for compatibility and includes additional variant builds and size checks.
+Per-route values overlap the aggregate values and must not be summed together.
+
+The `database` object separates `fanout_journal_barrier`, `fanout_db_begin`,
+`fanout_db_writes`, and `fanout_db_commit` (each has `elapsed_us` and `calls`).
+`fanout_persist_total` is their parent duration; database totals count the parent
+once and exclude its nested stages. WAL/FULL durability remains enabled for
+background commits; the live worker does not wait for a pre-send commit.
+
+Run the isolated four-route baseline without sending live transactions:
+
+```sh
+BENCH_FANOUT=1 BENCH_PREPARATION_WORKERS=4 BENCH_CONCURRENT_SENDS=32 cargo test --lib --release --offline benchmark_random_laserstream_to_sender -- --ignored --nocapture
+```
+
+This imports the four configured routes' provider types, tips and fees, overrides
+every endpoint with a local mock, and uses fixture authentication keys. It uses
+one mock durable nonce and waits for each previous copy's recorded outcome and
+mock finalized nonce refresh before delivering the next receipt. It measures
+per-copy processing cost, not burst handling or sustained 200 TPS. The mock marks
+only one variant per nonce as landed, and verifies 1,000 landed copies, 4,000
+submissions and four durable variant records per copy. The journal is a temporary
+on-disk SQLite database; runtime startup, prior-copy waiting, and fixture generation
+are excluded from receipt-to-send timing. Production finality and networking are
+not modeled. Source observations are synthetic Pump.fun buys, not a replay of the
+reported SellV2 transaction.
+
+`fee_balance_lookup_us` isolates the native balance lookup used to reserve fees,
+tips, and rent after route construction; it can include an RPC cache miss.
+`fanout_variants_serialize_us` isolates preparing the durable variant records.
+Both are inside `post_route_preparation_us`, which is broader than the DB commit.
+
+### QuickNode fanout route
+
+QuickNode uses the existing `provider = "json_rpc"` fanout transport and standard
+[`sendTransaction`](https://www.quicknode.com/docs/solana/sendTransaction). Add a
+route alongside the existing providers (with fanout enabled and nonce accounts
+configured):
+
+```toml
+[[mainnet.fanout.routes]]
+name = "quicknode"
+provider = "json_rpc"
+url = "https://YOUR-ENDPOINT.solana-mainnet.quiknode.pro/YOUR-TOKEN/"
+tip_account = "11111111111111111111111111111111"
+tip_lamports = 0
+priority_fee_micro_lamports = 100000
+```
+
+The standard RPC route has no tip transfer when `tip_lamports = 0`; it uses the
+configured priority fee and races the other routes with the same durable nonce.
+Keep the real endpoint token in ignored `config.toml`.
+
+Fanout journal writes now run on the ordered background writer; submission does not wait for SQLite. Graceful shutdown drains the writer. An abrupt crash or persistence failure can lose submitted variant and nonce records, reducing restart recovery guarantees. Nonce leases remain reserved in memory until finalized advancement.
+
+For new fanout copies, sender request and response timings follow the landed signature’s successful acknowledgment, rather than the slowest route. Identical signatures use the earliest successful acknowledgment and do not establish endpoint attribution. If the landed signature had no successful acknowledgment, these timings are unavailable. `fanout_all_requests_us` records the full fanout drain duration separately. Historical timings are unchanged.
+
+Astralane Iris fanout uses `provider = "astralane"`, `ASTRALANE_API_KEY` in a sensitive `api_key` header, and standard base64 `sendTransaction` requests. The configured New York HTTPS route tips 0.001 SOL, matching the documented free-tier minimum (5 TPS); higher tiers may allow lower tips. Health checks use `getHealth`. Credentials and provider error bodies are excluded from logged errors. Confirmation remains on the existing Solana RPC. See https://astralane.gitbook.io/docs/low-latency/submit-transactions and https://astralane.gitbook.io/docs/low-latency/send-txn-fee-tiers.

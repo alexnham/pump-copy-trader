@@ -70,7 +70,7 @@ impl TestRpc {
                             let delay = result.get("test_delay_ms").and_then(Value::as_u64).unwrap_or(0);
                             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                             in_flight.fetch_sub(1, Ordering::SeqCst);
-                            let body = if result.get("error").is_some() { json!({"jsonrpc":"2.0","id":request["id"],"error":result["error"]}) } else { json!({"jsonrpc":"2.0","id":request["id"],"result":result.get("test_result").unwrap_or(&result)}) }.to_string();
+                            let body = if let Some(raw) = result.get("test_raw_response") { raw.clone() } else if result.get("error").is_some() { json!({"jsonrpc":"2.0","id":request["id"],"error":result["error"]}) } else { json!({"jsonrpc":"2.0","id":request["id"],"result":result.get("test_result").unwrap_or(&result)}) }.to_string();
                             let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
                             let _ = socket.write_all(response.as_bytes()).await;
                         });

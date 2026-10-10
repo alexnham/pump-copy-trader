@@ -8,7 +8,9 @@ use std::{
 use tokio::{sync::mpsc, task::JoinHandle};
 
 type Write = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
-const CAPACITY: usize = 4096;
+// A 1,000-copy burst emits several journal writes per trade before SQLite
+// catches up. Keep a bounded buffer large enough for that burst.
+const CAPACITY: usize = 16_384;
 
 pub(super) struct Journal {
     sender: mpsc::Sender<Write>,

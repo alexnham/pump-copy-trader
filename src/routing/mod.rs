@@ -35,6 +35,7 @@ pub struct ExecutableRoute {
     pub route: PreparedRoute,
     pub transaction: Transaction,
     pub variants: Vec<Transaction>,
+    pub variant_route_indices: Vec<usize>,
     pub nonce: Option<crate::mainnet::nonce::NonceLease>,
     pub simulation_json: String,
 }
@@ -136,6 +137,75 @@ impl Router {
                     CopyTraderError::Execution("background blockhash cache is not ready".to_owned())
                 })?
             };
+            const BUILD_KEYS: [&str; 32] = [
+                "variant_0_build_us",
+                "variant_1_build_us",
+                "variant_2_build_us",
+                "variant_3_build_us",
+                "variant_4_build_us",
+                "variant_5_build_us",
+                "variant_6_build_us",
+                "variant_7_build_us",
+                "variant_8_build_us",
+                "variant_9_build_us",
+                "variant_10_build_us",
+                "variant_11_build_us",
+                "variant_12_build_us",
+                "variant_13_build_us",
+                "variant_14_build_us",
+                "variant_15_build_us",
+                "variant_16_build_us",
+                "variant_17_build_us",
+                "variant_18_build_us",
+                "variant_19_build_us",
+                "variant_20_build_us",
+                "variant_21_build_us",
+                "variant_22_build_us",
+                "variant_23_build_us",
+                "variant_24_build_us",
+                "variant_25_build_us",
+                "variant_26_build_us",
+                "variant_27_build_us",
+                "variant_28_build_us",
+                "variant_29_build_us",
+                "variant_30_build_us",
+                "variant_31_build_us",
+            ];
+            const SIGN_KEYS: [&str; 32] = [
+                "variant_0_sign_us",
+                "variant_1_sign_us",
+                "variant_2_sign_us",
+                "variant_3_sign_us",
+                "variant_4_sign_us",
+                "variant_5_sign_us",
+                "variant_6_sign_us",
+                "variant_7_sign_us",
+                "variant_8_sign_us",
+                "variant_9_sign_us",
+                "variant_10_sign_us",
+                "variant_11_sign_us",
+                "variant_12_sign_us",
+                "variant_13_sign_us",
+                "variant_14_sign_us",
+                "variant_15_sign_us",
+                "variant_16_sign_us",
+                "variant_17_sign_us",
+                "variant_18_sign_us",
+                "variant_19_sign_us",
+                "variant_20_sign_us",
+                "variant_21_sign_us",
+                "variant_22_sign_us",
+                "variant_23_sign_us",
+                "variant_24_sign_us",
+                "variant_25_sign_us",
+                "variant_26_sign_us",
+                "variant_27_sign_us",
+                "variant_28_sign_us",
+                "variant_29_sign_us",
+                "variant_30_sign_us",
+                "variant_31_sign_us",
+            ];
+            let build_started = std::time::Instant::now();
             let build_timer = timings.stages.start("transaction_build_ms");
             let instructions = if let Some(lease) = &nonce {
                 mainnet.fanout_instructions(
@@ -169,14 +239,22 @@ impl Router {
             );
             let mut transaction = Transaction::new_unsigned(message);
             drop(build_timer);
+            let elapsed = build_started.elapsed();
+            timings.stages.record_us(BUILD_KEYS[0], elapsed);
+            timings.stages.record_us("variant_build_us", elapsed);
+            let sign_started = std::time::Instant::now();
             let signing_timer = timings.stages.start("transaction_sign_ms");
             transaction.try_sign(&signers, blockhash).map_err(|error| {
                 CopyTraderError::Execution(format!("cannot sign source transaction: {error}"))
             })?;
+            let elapsed = sign_started.elapsed();
+            timings.stages.record_us(SIGN_KEYS[0], elapsed);
+            timings.stages.record_us("signing_only_us", elapsed);
             let mut variants = Vec::new();
             if let Some(lease) = &nonce {
                 variants.push(transaction.clone());
-                for config in mainnet.fanout.routes.iter().skip(1) {
+                for (index, config) in mainnet.fanout.routes.iter().enumerate().skip(1) {
+                    let variant_started = std::time::Instant::now();
                     let instructions = mainnet.fanout_instructions(
                         &signer.pubkey(),
                         route.compute_unit_limit,
@@ -191,22 +269,41 @@ impl Router {
                             &blockhash,
                         ),
                     );
+                    let elapsed = variant_started.elapsed();
+                    timings.stages.record_us(BUILD_KEYS[index], elapsed);
+                    timings.stages.record_us("variant_build_us", elapsed);
+                    let sign_started = std::time::Instant::now();
                     variant.try_sign(&signers, blockhash).map_err(|e| {
                         CopyTraderError::Execution(format!("cannot sign fanout variant: {e}"))
                     })?;
+                    let elapsed = sign_started.elapsed();
+                    timings.stages.record_us(SIGN_KEYS[index], elapsed);
+                    timings.stages.record_us("signing_only_us", elapsed);
                     variants.push(variant);
                 }
             }
-            for tx in &variants {
-                let size = bincode::serialized_size(tx).map_err(|e| {
-                    CopyTraderError::Execution(format!("cannot size transaction: {e}"))
-                })?;
-                if size > 1232 {
-                    return Err(CopyTraderError::Execution(format!(
-                        "signed transaction exceeds Solana packet limit: {size} bytes"
-                    )));
+            let size_started = std::time::Instant::now();
+            let mut variant_route_indices = Vec::new();
+            if nonce.is_some() {
+                let mut fitting = Vec::new();
+                for (index, tx) in variants.into_iter().enumerate() {
+                    let size = transaction_size(&tx)?;
+                    if size > 1232 {
+                        tracing::warn!(route = %mainnet.fanout.routes[index].name, size, "skipping oversized fanout variant");
+                    } else {
+                        variant_route_indices.push(index);
+                        fitting.push(tx);
+                    }
                 }
+                variants = fitting;
+                transaction = variants.first().cloned().ok_or_else(|| {
+                    CopyTraderError::Execution("all fanout variants exceed Solana packet limit: 1232 bytes".into())
+                })?;
             }
+
+            timings
+                .stages
+                .record_us("variant_size_checks_us", size_started.elapsed());
             drop(signing_timer);
             route.instructions = instructions;
             info!(dex = route.dex.as_str(), "source instruction copied");
@@ -214,6 +311,7 @@ impl Router {
                 route,
                 transaction,
                 variants,
+                variant_route_indices,
                 nonce,
                 simulation_json: "{\"skipped\":true,\"reason\":\"hot_path_no_simulation\"}"
                     .to_owned(),
@@ -234,4 +332,9 @@ fn source_outputs(trade: &SizedTrade, slippage_bps: u16) -> Result<(u64, u64)> {
             CopyTraderError::Execution("invalid source-price output estimate".to_owned())
         })?;
     Ok((expected, math::apply_slippage(expected, slippage_bps)?))
+}
+
+fn transaction_size(transaction: &Transaction) -> Result<u64> {
+    bincode::serialized_size(transaction)
+        .map_err(|e| CopyTraderError::Execution(format!("cannot size transaction: {e}")))
 }

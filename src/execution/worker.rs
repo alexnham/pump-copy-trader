@@ -43,13 +43,17 @@ pub struct ExecutionWorker {
     decoder: TransactionDecoder,
     router: Arc<Router>,
     balance_cache: WalletBalanceCache,
-    last_submitted_slot: u64,
+    last_submitted_slot: Arc<std::sync::atomic::AtomicU64>,
     pending: JoinSet<()>,
     reservations: Arc<Mutex<BalanceReservations>>,
     dispatched: bool,
     reservation_gate: Arc<Mutex<()>>,
     handled_signatures: std::collections::HashSet<solana_sdk::signature::Signature>,
     execution_admitted: bool,
+    submission_slots: Arc<tokio::sync::Semaphore>,
+    lifecycle_slots: Arc<tokio::sync::Semaphore>,
+    lifecycle_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    preparation_worker_id: usize,
 }
 
 impl ExecutionWorker {
@@ -62,6 +66,9 @@ impl ExecutionWorker {
         decoder: TransactionDecoder,
         router: Arc<Router>,
     ) -> Self {
+        let submission_slots = Arc::new(tokio::sync::Semaphore::new(
+            config.execution.max_concurrent_sends,
+        ));
         Self {
             config,
             signer,
@@ -71,13 +78,17 @@ impl ExecutionWorker {
             decoder,
             router,
             balance_cache: WalletBalanceCache::default(),
-            last_submitted_slot: 0,
+            last_submitted_slot: Default::default(),
             pending: JoinSet::new(),
             reservations: Default::default(),
             dispatched: false,
             reservation_gate: Default::default(),
             handled_signatures: Default::default(),
             execution_admitted: false,
+            submission_slots,
+            lifecycle_slots: Arc::new(tokio::sync::Semaphore::new(64)),
+            lifecycle_permit: None,
+            preparation_worker_id: 0,
         }
     }
 
@@ -87,6 +98,22 @@ impl ExecutionWorker {
     }
 
     pub async fn run(mut self, input: Receiver<QueuedObservation>) -> Result<()> {
+        if self.config.execution.preparation_workers == 1 {
+            self.run_single(input).await
+        } else if self.store.has_background_journal() {
+            self.run_pool(input).await
+        } else {
+            // Parallel preparation must use the same ordered journal as the live
+            // service, including standalone callers with a direct SQLite store.
+            let (store, mut journal) = self.store.background_journal().await?;
+            self.store = store;
+            let result = self.run_pool(input).await;
+            let persisted = journal.wait().await;
+            result.and(persisted)
+        }
+    }
+
+    async fn run_single(mut self, input: Receiver<QueuedObservation>) -> Result<()> {
         let writer = TimingWriter::new(self.store.clone());
         let result = self.run_inner(input, &writer).await;
         while let Some(result) = self.pending.join_next().await {
@@ -127,6 +154,13 @@ impl ExecutionWorker {
                     error!(%error, "background settlement task failed; reservations retained");
                 }
             }
+            self.lifecycle_permit = Some(
+                self.lifecycle_slots
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| CopyTraderError::Execution("lifecycle semaphore closed".into()))?,
+            );
             self.dispatched = false;
             self.execution_admitted = false;
             let worker_started = Instant::now();
@@ -135,6 +169,9 @@ impl ExecutionWorker {
             let source_signature = queued.observed.signature.to_string();
             let signature = queued.observed.signature;
             let mut timings = CopyTimings::new(queued.received_at);
+            timings
+                .values
+                .insert("preparation_worker_id", self.preparation_worker_id as u64);
             timings
                 .values
                 .insert("preconfirmation", u64::from(preconfirmation));
@@ -152,6 +189,11 @@ impl ExecutionWorker {
             timings.database = queued.database_timings;
             self.store = self.store.with_timings(timings.database.clone());
             let result = self.handle(queued.observed, &mut timings, writer).await;
+            // Successful dispatch transfers the permit to the background copy.
+            self.lifecycle_permit.take();
+            if !self.dispatched {
+                self.reset_idle_reservations().await;
+            }
             if !preconfirmation || self.execution_admitted {
                 self.handled_signatures.insert(signature);
             }
@@ -200,11 +242,13 @@ impl ExecutionWorker {
         timings: &mut CopyTimings,
         writer: &TimingWriter,
     ) -> Result<()> {
-        let reservation_gate = self.reservation_gate.clone();
-        let _reservation_guard = reservation_gate.lock().await;
         let checks_started = Instant::now();
         let source_signature = observed.signature.to_string();
-        if observed.slot < self.last_submitted_slot {
+        if observed.slot
+            < self
+                .last_submitted_slot
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             self.store
                 .mark_skipped(&source_signature, SkipReason::OutOfOrder)
                 .await?;
@@ -287,12 +331,29 @@ impl ExecutionWorker {
             return Ok(());
         }
         let mut routing_timings = RoutingTimings::default();
+        let metadata_started = Instant::now();
         let direct_mints =
             direct_source_mints(&intent, observed.meta.post_token_balances.as_deref());
-        let (intent_write, reads) = tokio::join!(
-            self.store.mark_intent(&source_signature, &intent),
-            self.initial_reads(&intent, direct_mints),
+        timings.values.insert(
+            "source_mint_metadata_us",
+            CopyTimings::micros(metadata_started.elapsed()),
         );
+        let ((intent_write, journal_us), (reads, reads_us)) = tokio::join!(
+            async {
+                let start = Instant::now();
+                let result = self.store.mark_intent(&source_signature, &intent).await;
+                (result, CopyTimings::micros(start.elapsed()))
+            },
+            async {
+                let start = Instant::now();
+                let result = self.initial_reads(&intent, direct_mints).await;
+                (result, CopyTimings::micros(start.elapsed()))
+            },
+        );
+        timings
+            .values
+            .insert("intent_journal_enqueue_us", journal_us);
+        timings.values.insert("initial_reads_us", reads_us);
         intent_write?;
         let InitialReads {
             input_info,
@@ -300,27 +361,55 @@ impl ExecutionWorker {
             native_balance,
             mint_read_ms,
             mint_from_source,
+            balance_metrics,
         } = reads?;
+        timings.values.extend(balance_metrics);
         timings.values.insert("mint_read_ms", mint_read_ms);
         timings
             .values
             .insert("mint_from_source", u64::from(mint_from_source));
+        // Exit sizing and WSOL funding depend on the shared remaining position.
+        // Pure Pump.fun buys can build independently before the final admission gate.
+        let dependent_preparation = intent.input_asset != AssetId::NativeSol
+            || intent.source_instruction.as_ref().is_some_and(|source| {
+                source.instruction.program_id == crate::domain::DexKind::PumpSwap.program_id()
+            });
+        let reservation_gate = self.reservation_gate.clone();
+        let mut reservation_guard = None;
+        if dependent_preparation {
+            let started = Instant::now();
+            reservation_guard = Some(reservation_gate.clone().lock_owned().await);
+            timings.values.insert(
+                "reservation_gate_wait_us",
+                CopyTimings::micros(started.elapsed()),
+            );
+        }
         let sizing = SizingPolicy::new(&self.config.sizing);
+        let ata_started = Instant::now();
         let input_account = associated_token_address(
             &self.signer.pubkey(),
             &input_mint,
             &input_info.token_program,
         );
+        timings.values.insert(
+            "input_ata_lookup_us",
+            CopyTimings::micros(ata_started.elapsed()),
+        );
         let exiting_to_sol = matches!(intent.input_asset, AssetId::Token(_))
             && intent.output_asset == AssetId::NativeSol;
         let exit_balance = if exiting_to_sol {
             Some(
-                self.cached_asset_balance(intent.input_asset, &input_account)
-                    .await?,
+                self.measured_asset_balance(
+                    intent.input_asset,
+                    &input_account,
+                    &mut timings.values,
+                )
+                .await?,
             )
         } else {
             None
         };
+        let sizing_started = Instant::now();
         let result = if let Some(balance) = exit_balance {
             let source_before = source_position_before(
                 &intent,
@@ -335,6 +424,10 @@ impl ExecutionWorker {
         } else {
             sizing.size_trade(intent, &input_rule, input_info.decimals)?
         };
+        timings.values.insert(
+            "position_and_sizing_us",
+            CopyTimings::micros(sizing_started.elapsed()),
+        );
         let sized = match result {
             Ok(sized) => sized,
             Err(reason) => {
@@ -412,6 +505,7 @@ impl ExecutionWorker {
                 .await?;
             return Ok(());
         }
+        let attempt_started = Instant::now();
         let preconfirmation = observed.origin == crate::domain::SignalOrigin::Preconfirmation;
         if !preconfirmation
             && !self
@@ -426,6 +520,10 @@ impl ExecutionWorker {
         {
             return Ok(());
         }
+        timings.values.insert(
+            "attempt_reservation_us",
+            CopyTimings::micros(attempt_started.elapsed()),
+        );
         self.execution_admitted = !preconfirmation;
 
         timings.values.insert(
@@ -456,6 +554,27 @@ impl ExecutionWorker {
         timings.values.insert("route_ms", route_latency_ms);
         timings.values.extend(routing_timings.stages.snapshot());
         let winner = result?;
+        if reservation_guard.is_none() {
+            let started = Instant::now();
+            reservation_guard = Some(reservation_gate.lock_owned().await);
+            timings.values.insert(
+                "reservation_gate_wait_us",
+                CopyTimings::micros(started.elapsed()),
+            );
+        }
+        let _reservation_guard = reservation_guard.expect("admission gate acquired");
+        // A newer slot may have been dispatched while this copy was building.
+        if observed.slot
+            < self
+                .last_submitted_slot
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.store
+                .mark_skipped(&source_signature, SkipReason::OutOfOrder)
+                .await?;
+            return Ok(());
+        }
+
         // Build early candidates before claiming, so unsupported routes can still
         // be retried with the processed transaction's execution metadata.
         if preconfirmation {
@@ -502,12 +621,14 @@ impl ExecutionWorker {
                 CopyTraderError::Execution("signed transaction has no signature".to_owned())
             })?;
         timings.mark("transaction_signed_ms");
-        timings
-            .values
-            .insert("db_pre_send_us", timings.database.total_us());
+        let fee_balance_started = Instant::now();
         let native = self
             .cached_asset_balance(AssetId::NativeSol, &self.signer.pubkey())
             .await?;
+        timings.values.insert(
+            "fee_balance_lookup_us",
+            CopyTimings::micros(fee_balance_started.elapsed()),
+        );
         let mainnet =
             self.config.mainnet.as_ref().ok_or_else(|| {
                 CopyTraderError::Execution("mainnet configuration missing".into())
@@ -558,11 +679,13 @@ impl ExecutionWorker {
         }
         if let Some(lease) = &winner.nonce {
             let mainnet = self.backend.mainnet().expect("mainnet backend");
+            let variants_started = Instant::now();
             let variants = winner
                 .variants
                 .iter()
-                .zip(&mainnet.fanout.routes)
-                .map(|(tx, route)| {
+                .zip(&winner.variant_route_indices)
+                .map(|(tx, &index)| {
+                    let route = &mainnet.fanout.routes[index];
                     Ok((
                         tx.signatures[0].to_string(),
                         bincode::serialize(tx).map_err(|e| {
@@ -574,15 +697,39 @@ impl ExecutionWorker {
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            // Arm before awaiting the commit: cancellation during a commit must
-            // conservatively keep this nonce held until a restart checks the DB.
+            timings.values.insert(
+                "fanout_variants_serialize_us",
+                CopyTimings::micros(variants_started.elapsed()),
+            );
+            // Keep the nonce held before queueing persistence or submitting.
+            // Journal writes drain in order; abrupt crashes can lose this record.
             lease.mark_submitted();
             self.store
-                .persist_fanout(
+                .enqueue_fanout(
                     &source_signature,
                     &lease.account.to_string(),
                     &lease.hash.to_string(),
                     &variants,
+                    &winner.simulation_json,
+                )
+                .await?;
+        }
+        self.store
+            .mark_route(
+                &source_signature,
+                winner.route.dex.as_str(),
+                &winner.route.pool.to_string(),
+                winner.route.minimum_output,
+                winner.route.expected_output,
+                route_latency_ms,
+            )
+            .await?;
+        if winner.nonce.is_none() {
+            self.store
+                .persist_signed(
+                    &source_signature,
+                    &local_signature.to_string(),
+                    &signed,
                     &winner.simulation_json,
                 )
                 .await?;
@@ -610,94 +757,8 @@ impl ExecutionWorker {
             "post_route_preparation_us",
             CopyTimings::micros(post_route_started.elapsed()),
         );
-        timings.stage("sender_request_ms");
-        timings.mark("sender_request_started_ms");
-        timings.since_receipt("receipt_to_send_start_ms");
-        timings.values.insert(
-            "receipt_to_send_start_us",
-            CopyTimings::micros(timings.received_at.elapsed()),
-        );
-        let sender_started = Instant::now();
-        self.last_submitted_slot = self.last_submitted_slot.max(observed.slot);
-        let send_result = if winner.nonce.is_some() {
-            self.backend
-                .mainnet()
-                .expect("mainnet backend")
-                .send_fanout(&winner.variants)
-                .await;
-            // Poll all locally known signatures even when every request errored.
-            Ok(local_signature)
-        } else {
-            self.backend.send(&winner.transaction).await
-        };
-        timings.values.insert(
-            "sender_request_us",
-            CopyTimings::micros(sender_started.elapsed()),
-        );
-        timings.mark("sender_response_received_ms");
-        timings.since_receipt("receipt_to_send_response_ms");
-        timings.finish();
-        timings.stage("post_send_journal_ms");
-        if let Err(error) = self
-            .store
-            .mark_route(
-                &source_signature,
-                winner.route.dex.as_str(),
-                &winner.route.pool.to_string(),
-                winner.route.minimum_output,
-                winner.route.expected_output,
-                route_latency_ms,
-            )
-            .await
-        {
-            warn!(%error, %source_signature, %local_signature, "route journal write failed after submission");
-        }
-        if winner.nonce.is_none() {
-            if let Err(error) = self
-                .store
-                .persist_signed(
-                    &source_signature,
-                    &local_signature.to_string(),
-                    &signed,
-                    &winner.simulation_json,
-                )
-                .await
-            {
-                warn!(%error, %source_signature, %local_signature, "signed transaction journal write failed after submission");
-            }
-        }
-        timings.finish();
-        match send_result {
-            Ok(returned) if returned == local_signature => {}
-            Ok(returned) => {
-                let mut reservations = self.reservations.lock().await;
-                reservations.uncertain = true;
-                reservations.pending -= 1;
-                drop(reservations);
-                self.store
-                    .update_attempt(
-                        &source_signature,
-                        AttemptStatus::Unknown,
-                        Some(&format!("backend returned unexpected signature {returned}")),
-                    )
-                    .await?;
-                return Ok(());
-            }
-            Err(error) => {
-                let mut reservations = self.reservations.lock().await;
-                reservations.uncertain = true;
-                reservations.pending -= 1;
-                drop(reservations);
-                self.store
-                    .update_attempt(
-                        &source_signature,
-                        AttemptStatus::Unknown,
-                        Some(&error.to_string()),
-                    )
-                    .await?;
-                return Ok(());
-            }
-        }
+        self.last_submitted_slot
+            .fetch_max(observed.slot, std::sync::atomic::Ordering::AcqRel);
         let mut settlement = Self::new(
             self.config.clone(),
             self.signer.clone(),
@@ -710,6 +771,8 @@ impl ExecutionWorker {
         .with_balance_cache(self.balance_cache.clone());
         settlement.reservations = self.reservations.clone();
         settlement.reservation_gate = self.reservation_gate.clone();
+        settlement.submission_slots = self.submission_slots.clone();
+        settlement.lifecycle_slots = self.lifecycle_slots.clone();
         let timings = timings.clone();
         self.dispatched = true;
         let timing_sender = writer.sender();
@@ -722,6 +785,7 @@ impl ExecutionWorker {
                 output_account,
                 local_signature,
                 route_latency_ms,
+                lifecycle_permit: self.lifecycle_permit.take(),
             },
             timings,
             timing_sender,
@@ -729,14 +793,98 @@ impl ExecutionWorker {
         Ok(())
     }
 
+    async fn submit(&self, copy: &PendingCopy, timings: &mut CopyTimings) -> Result<bool> {
+        let source_signature = copy.observed.signature.to_string();
+        let wait_started = Instant::now();
+        let permit = self
+            .submission_slots
+            .acquire()
+            .await
+            .map_err(|_| CopyTraderError::Execution("submission semaphore closed".into()))?;
+        timings.values.insert(
+            "submission_wait_us",
+            CopyTimings::micros(wait_started.elapsed()),
+        );
+        timings
+            .values
+            .insert("db_pre_send_us", timings.database.total_us());
+        timings.stage("sender_request_ms");
+        timings.mark("sender_request_started_ms");
+        timings.since_receipt("receipt_to_send_start_ms");
+        timings.values.insert(
+            "receipt_to_send_start_us",
+            CopyTimings::micros(timings.received_at.elapsed()),
+        );
+        let sender_started = Instant::now();
+        let send_result = if copy.winner.nonce.is_some() {
+            timings.fanout_submissions = self
+                .backend
+                .mainnet()
+                .expect("mainnet backend")
+                .send_fanout_indexed(&copy.winner.variants, &copy.winner.variant_route_indices)
+                .await;
+            // Poll all locally known signatures even when every request errored.
+            Ok(copy.local_signature)
+        } else {
+            self.backend.send(&copy.winner.transaction).await
+        };
+        let elapsed = CopyTimings::micros(sender_started.elapsed());
+        timings.values.insert("sender_request_us", elapsed);
+        if copy.winner.nonce.is_some() {
+            timings.values.insert("fanout_all_requests_us", elapsed);
+        }
+        timings.mark("sender_response_received_ms");
+        timings.since_receipt("receipt_to_send_response_ms");
+        timings.finish();
+        match send_result {
+            Ok(returned) if returned == copy.local_signature => {}
+            Ok(returned) => {
+                let mut reservations = self.reservations.lock().await;
+                reservations.uncertain = true;
+                drop(reservations);
+                self.store
+                    .update_attempt(
+                        &source_signature,
+                        AttemptStatus::Unknown,
+                        Some(&format!("backend returned unexpected signature {returned}")),
+                    )
+                    .await?;
+                return Ok(false);
+            }
+            Err(error) => {
+                let mut reservations = self.reservations.lock().await;
+                reservations.uncertain = true;
+                drop(reservations);
+                self.store
+                    .update_attempt(
+                        &source_signature,
+                        AttemptStatus::Unknown,
+                        Some(&error.to_string()),
+                    )
+                    .await?;
+                return Ok(false);
+            }
+        }
+        drop(permit);
+        Ok(true)
+    }
+
     async fn run_settlement(
         mut self,
-        copy: PendingCopy,
+        mut copy: PendingCopy,
         mut timings: CopyTimings,
         timing_sender: tokio::sync::mpsc::Sender<(String, String)>,
     ) {
+        let lifecycle_permit = copy.lifecycle_permit.take();
         let source_signature = copy.observed.signature.to_string();
-        let result = self.settle(copy, &mut timings).await;
+        let result = match self.submit(&copy, &mut timings).await {
+            Ok(true) => self.settle(copy, &mut timings).await,
+            Ok(false) => Ok(()),
+            Err(error) => {
+                self.reservations.lock().await.uncertain = true;
+                Err(error)
+            }
+        };
         if let Err(error) = result {
             if let Err(journal_error) = self
                 .store
@@ -751,24 +899,12 @@ impl ExecutionWorker {
             }
             error!(%error, %source_signature, "copy settlement failed");
         }
-        // Keep debits conservative across the entire overlapping batch. Unknown
-        // submissions hold their budget until startup recovery.
-        let _gate = self.reservation_gate.lock().await;
-        let mut reservations = self.reservations.lock().await;
-        reservations.pending -= 1;
-        if reservations.pending == 0 && !reservations.uncertain {
-            for address in reservations.remaining.keys() {
-                if let Err(error) = self.balance_cache.invalidate(address).await {
-                    error!(%error, "reservation cache invalidation failed");
-                    reservations.uncertain = true;
-                    break;
-                }
-            }
-            if !reservations.uncertain {
-                reservations.remaining.clear();
-            }
+        {
+            let _gate = self.reservation_gate.lock().await;
+            self.reservations.lock().await.pending -= 1;
         }
-        drop(reservations);
+        drop(lifecycle_permit);
+        self.reset_idle_reservations().await;
         timings.finish();
         if let Ok(json) = timings.json() {
             info!(%source_signature, timings = %json, "copy timings");
@@ -777,6 +913,30 @@ impl ExecutionWorker {
                 warn!(%source_signature, "timing queue unavailable; copy timings remain in logs");
             }
         }
+    }
+
+    async fn reset_idle_reservations(&self) {
+        // Prepared copies can still be using this batch's balance snapshots.
+        // Reset only after preparation, submission and settlement are all idle.
+        if self.lifecycle_slots.available_permits() != 64 {
+            return;
+        }
+        let _gate = self.reservation_gate.lock().await;
+        let mut reservations = self.reservations.lock().await;
+        if self.lifecycle_slots.available_permits() != 64
+            || reservations.pending != 0
+            || reservations.uncertain
+        {
+            return;
+        }
+        for address in reservations.remaining.keys() {
+            if let Err(error) = self.balance_cache.invalidate(address).await {
+                error!(%error, "reservation cache invalidation failed");
+                reservations.uncertain = true;
+                return;
+            }
+        }
+        reservations.remaining.clear();
     }
 
     async fn settle(&mut self, copy: PendingCopy, timings: &mut CopyTimings) -> Result<()> {
@@ -788,6 +948,7 @@ impl ExecutionWorker {
             output_account,
             mut local_signature,
             route_latency_ms,
+            lifecycle_permit: _,
         } = copy;
         let source_signature = observed.signature.to_string();
         timings.stage("confirmation_ms");
@@ -817,8 +978,11 @@ impl ExecutionWorker {
             Ok((signature, confirmation)) => {
                 local_signature = signature;
                 if winner.nonce.is_some() {
+                    timings.select_landed_sender(signature);
+                }
+                if winner.nonce.is_some() {
                     self.store
-                        .select_variant(&source_signature, &signature.to_string())
+                        .enqueue_selected_variant(&source_signature, &signature.to_string())
                         .await?;
                 }
                 confirmation
@@ -893,7 +1057,9 @@ impl ExecutionWorker {
                     .variants
                     .iter()
                     .position(|tx| tx.signatures[0] == local_signature)
-                    .map_or(0, |index| mainnet.fanout.routes[index].tip_lamports)
+                    .map_or(0, |index| {
+                        mainnet.fanout.routes[winner.variant_route_indices[index]].tip_lamports
+                    })
             } else {
                 mainnet.tip_lamports()
             }
@@ -986,23 +1152,32 @@ impl ExecutionWorker {
                 },
                 async {
                     if matches!(intent.input_asset, AssetId::NativeSol) {
-                        self.cached_asset_balance(AssetId::NativeSol, &self.signer.pubkey())
-                            .await
-                            .map(Some)
+                        let mut metrics = Default::default();
+                        let amount = self
+                            .measured_asset_balance(
+                                AssetId::NativeSol,
+                                &self.signer.pubkey(),
+                                &mut metrics,
+                            )
+                            .await?;
+                        Ok((Some(amount), metrics))
                     } else {
-                        Ok(None)
+                        Ok((None, Default::default()))
                     }
                 }
             )
         };
-        let (((input_info, output_info), mint_read_ms, mint_from_source), native_balance) =
-            preparation.await?;
+        let (
+            ((input_info, output_info), mint_read_ms, mint_from_source),
+            (native_balance, balance_metrics),
+        ) = preparation.await?;
         Ok(InitialReads {
             input_info,
             output_info,
             native_balance,
             mint_read_ms,
             mint_from_source,
+            balance_metrics,
         })
     }
 
@@ -1027,6 +1202,54 @@ impl ExecutionWorker {
             }
         }
         Ok(())
+    }
+
+    async fn measured_asset_balance(
+        &self,
+        asset: AssetId,
+        token_account: &Pubkey,
+        metrics: &mut std::collections::BTreeMap<&'static str, u64>,
+    ) -> Result<u64> {
+        let started = Instant::now();
+        let address = if asset == AssetId::NativeSol {
+            self.signer.pubkey()
+        } else {
+            *token_account
+        };
+        let lock_started = Instant::now();
+        let reservations = self.reservations.lock().await;
+        let mut lock_us = CopyTimings::micros(lock_started.elapsed());
+        let reserved = reservations.remaining.get(&address).copied();
+        drop(reservations);
+        let amount = if let Some(amount) = reserved {
+            metrics.insert("input_balance_reserved", 1);
+            amount
+        } else {
+            metrics.insert("input_balance_reserved", 0);
+            let (amount, hit, cache_lock_us, fetch_us) = self
+                .balance_cache
+                .get_or_fetch_measured(
+                    self.backend.rpc(),
+                    asset,
+                    self.signer.pubkey(),
+                    *token_account,
+                )
+                .await?;
+            metrics.insert("input_balance_cache_hit", u64::from(hit));
+            metrics.insert("input_balance_cache_miss", u64::from(!hit));
+            metrics.insert("input_balance_cache_lock_wait_us", cache_lock_us);
+            metrics.insert("input_balance_fetch_us", fetch_us);
+            let lock_started = Instant::now();
+            let reservations = self.reservations.lock().await;
+            lock_us += CopyTimings::micros(lock_started.elapsed());
+            reservations.available(address, amount)
+        };
+        metrics.insert("input_balance_reservation_lock_wait_us", lock_us);
+        metrics.insert(
+            "input_balance_lookup_us",
+            CopyTimings::micros(started.elapsed()),
+        );
+        Ok(amount)
     }
 
     async fn cached_asset_balance(&self, asset: AssetId, token_account: &Pubkey) -> Result<u64> {
@@ -1117,6 +1340,7 @@ struct InitialReads {
     native_balance: Option<u64>,
     mint_read_ms: u64,
     mint_from_source: bool,
+    balance_metrics: std::collections::BTreeMap<&'static str, u64>,
 }
 
 fn direct_source_mints(
@@ -1174,15 +1398,50 @@ fn direct_source_mints(
 #[derive(Clone)]
 struct CopyTimings {
     received_at: Instant,
+    fanout_submissions: Vec<(solana_sdk::signature::Signature, u64, bool)>,
     database: DatabaseTimings,
     active: Option<(&'static str, Instant)>,
     values: std::collections::BTreeMap<&'static str, u64>,
 }
 
 impl CopyTimings {
+    fn select_landed_sender(&mut self, signature: solana_sdk::signature::Signature) {
+        // Only successful acknowledgments establish a sender response timing.
+        // Shared signatures cannot identify the physical delivery endpoint.
+        let elapsed = self
+            .fanout_submissions
+            .iter()
+            .filter(|(sig, _, accepted)| *sig == signature && *accepted)
+            .map(|(_, elapsed, _)| *elapsed)
+            .min();
+        for key in [
+            "sender_request_us",
+            "sender_request_ms",
+            "sender_response_received_ms",
+            "receipt_to_send_response_ms",
+        ] {
+            self.values.remove(key);
+        }
+        if let Some(elapsed) = elapsed {
+            self.values.insert("sender_request_us", elapsed);
+            self.values.insert("sender_request_ms", elapsed / 1000);
+            let total = self
+                .values
+                .get("receipt_to_send_start_us")
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(elapsed);
+            self.values
+                .insert("sender_response_received_ms", total / 1000);
+            self.values
+                .insert("receipt_to_send_response_ms", total / 1000);
+        }
+    }
+
     fn new(received_at: Instant) -> Self {
         let mut timings = Self {
             received_at,
+            fanout_submissions: Vec::new(),
             database: DatabaseTimings::default(),
             active: None,
             values: Default::default(),
@@ -1194,9 +1453,7 @@ impl CopyTimings {
     fn json(&self) -> Result<String> {
         let mut values = serde_json::to_value(&self.values)?;
         let database = self.database.snapshot();
-        let total_us = database.values().fold(0_u64, |total, timing| {
-            total.saturating_add(timing.elapsed_us)
-        });
+        let total_us = self.database.total_us();
         values["database"] = serde_json::to_value(database)?;
         values["db_total_us"] = total_us.into();
         if let Some(before_send) = self.values.get("db_pre_send_us") {
@@ -1234,6 +1491,23 @@ impl CopyTimings {
 
 #[cfg(test)]
 mod timing_tests {
+    #[test]
+    fn landed_sender_timing_excludes_slow_other_routes() {
+        let winner = solana_sdk::signature::Signature::new_unique();
+        let loser = solana_sdk::signature::Signature::new_unique();
+        let mut timing = super::CopyTimings::new(std::time::Instant::now());
+        timing.values.insert("receipt_to_send_start_us", 556);
+        timing.values.insert("fanout_all_requests_us", 1_502_156);
+        timing.fanout_submissions = vec![(loser, 1_502_156, false), (winner, 12_000, true)];
+        timing.select_landed_sender(winner);
+        assert_eq!(timing.values["sender_request_us"], 12_000);
+        assert_eq!(timing.values["receipt_to_send_response_ms"], 12);
+        assert_eq!(timing.values["fanout_all_requests_us"], 1_502_156);
+        timing.fanout_submissions = vec![(winner, 1_500_000, false)];
+        timing.select_landed_sender(winner);
+        assert!(!timing.values.contains_key("sender_request_us"));
+    }
+
     use super::*;
 
     #[test]
@@ -1585,69 +1859,78 @@ mod timing_tests {
             http::HttpTransport,
             mainnet::MainnetClient,
         };
-        let base = Store::connect("sqlite::memory:").await.expect("store");
-        let database_timings = DatabaseTimings::default();
-        let observed = ObservedTransaction {
-            signature: solana_sdk::signature::Signature::default(),
-            slot: 42,
-            block_time: Some(0),
-            origin: SignalOrigin::Live,
-            transaction: solana_sdk::transaction::VersionedTransaction::default(),
-            meta: TransactionMeta::default(),
-            raw_payload: "{}".to_owned(),
-            received_bytes: 2,
-        };
-        base.with_timings(database_timings.clone())
-            .record_observation(&observed)
-            .await
-            .expect("observation");
-        let config =
-            Arc::new(AppConfig::load(std::path::Path::new("config.example.toml")).expect("config"));
-        let endpoint = url::Url::parse("http://127.0.0.1:1").expect("unused endpoint");
-        let transport = HttpTransport::new(&HttpConfig::default()).expect("transport");
-        let backend = Arc::new(ExecutionBackend::Mainnet(Arc::new(MainnetClient::new(
-            endpoint.clone(),
-            config.mainnet.as_ref().expect("mainnet"),
-            transport.clone(),
-        ))));
-        let worker = ExecutionWorker::new(
-            config.clone(),
-            Arc::new(Keypair::new()),
-            base.clone(),
-            backend,
-            TokenSafetyClient::new(&endpoint, &transport),
-            TransactionDecoder::new(config.signal.wallet),
-            Arc::new(Router::new(
-                Arc::new(transport.solana_rpc(&endpoint)),
-                Duration::from_secs(2),
-            )),
-        );
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        sender
-            .send(QueuedObservation {
-                observed,
-                received_at: Instant::now() - Duration::from_millis(10),
-                queued_at: Instant::now() - Duration::from_millis(5),
-                payload_decode_us: 123,
-                observation_enqueue_us: 45,
-                database_timings: database_timings.clone(),
-            })
-            .await
-            .expect("enqueue");
-        drop(sender);
-        worker.run(receiver).await.expect("worker");
-        let rows = base.status(1).await.expect("rows");
-        assert_eq!(rows[0].source_status, "skipped");
-        let saved: serde_json::Value =
-            serde_json::from_str(rows[0].timings_json.as_deref().expect("timings")).expect("JSON");
-        assert_eq!(saved["database"]["record_observation"]["calls"], 1);
-        assert_eq!(saved["database"]["mark_skipped"]["calls"], 1);
-        assert!(saved["database"].get("record_timings").is_none());
-        assert!(!database_timings.snapshot().contains_key("record_timings"));
-        assert!(saved["ingestion_queue_ms"].as_u64().expect("delay") >= 10);
-        assert!(saved["queue_wait_us"].as_u64().expect("queue wait") >= 5000);
-        assert_eq!(saved["payload_decode_us"], 123);
-        assert_eq!(saved["observation_enqueue_us"], 45);
+        for preparation_workers in [1, 4] {
+            let base = Store::connect("sqlite::memory:").await.expect("store");
+            let database_timings = DatabaseTimings::default();
+            let observed = ObservedTransaction {
+                signature: solana_sdk::signature::Signature::default(),
+                slot: 42,
+                block_time: Some(0),
+                origin: SignalOrigin::Live,
+                transaction: solana_sdk::transaction::VersionedTransaction::default(),
+                meta: TransactionMeta::default(),
+                raw_payload: "{}".to_owned(),
+                received_bytes: 2,
+            };
+            base.with_timings(database_timings.clone())
+                .record_observation(&observed)
+                .await
+                .expect("observation");
+            let mut config =
+                AppConfig::load(std::path::Path::new("config.example.toml")).expect("config");
+            config.execution.preparation_workers = preparation_workers;
+            let config = Arc::new(config);
+            let endpoint = url::Url::parse("http://127.0.0.1:1").expect("unused endpoint");
+            let transport = HttpTransport::new(&HttpConfig::default()).expect("transport");
+            let backend = Arc::new(ExecutionBackend::Mainnet(Arc::new(MainnetClient::new(
+                endpoint.clone(),
+                config.mainnet.as_ref().expect("mainnet"),
+                transport.clone(),
+            ))));
+            let worker = ExecutionWorker::new(
+                config.clone(),
+                Arc::new(Keypair::new()),
+                base.clone(),
+                backend,
+                TokenSafetyClient::new(&endpoint, &transport),
+                TransactionDecoder::new(config.signal.wallet),
+                Arc::new(Router::new(
+                    Arc::new(transport.solana_rpc(&endpoint)),
+                    Duration::from_secs(2),
+                )),
+            );
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            sender
+                .send(QueuedObservation {
+                    observed,
+                    received_at: Instant::now() - Duration::from_millis(10),
+                    queued_at: Instant::now() - Duration::from_millis(5),
+                    payload_decode_us: 123,
+                    observation_enqueue_us: 45,
+                    database_timings: database_timings.clone(),
+                })
+                .await
+                .expect("enqueue");
+            drop(sender);
+            worker.run(receiver).await.expect("worker");
+            let rows = base.status(1).await.expect("rows");
+            assert_eq!(rows[0].source_status, "skipped");
+            let saved: serde_json::Value =
+                serde_json::from_str(rows[0].timings_json.as_deref().expect("timings"))
+                    .expect("JSON");
+            assert_eq!(saved["database"]["record_observation"]["calls"], 1);
+            if preparation_workers == 1 {
+                assert_eq!(saved["database"]["mark_skipped"]["calls"], 1);
+            } else {
+                assert!(saved["database"].get("mark_skipped").is_none());
+            }
+            assert!(saved["database"].get("record_timings").is_none());
+            assert!(!database_timings.snapshot().contains_key("record_timings"));
+            assert!(saved["ingestion_queue_ms"].as_u64().expect("delay") >= 10);
+            assert!(saved["queue_wait_us"].as_u64().expect("queue wait") >= 5000);
+            assert_eq!(saved["payload_decode_us"], 123);
+            assert_eq!(saved["observation_enqueue_us"], 45);
+        }
     }
 
     #[tokio::test]
@@ -1680,6 +1963,24 @@ mod timing_tests {
     }
 
     #[test]
+    fn database_totals_do_not_double_count_nested_fanout_stages() {
+        let mut timings = CopyTimings::new(Instant::now());
+        let parent = timings.database.start("fanout_persist_total");
+        let child = timings.database.start("fanout_db_commit");
+        drop(child);
+        drop(parent);
+        let before = timings.database.total_us();
+        timings.values.insert("db_pre_send_us", before);
+        let saved: serde_json::Value = serde_json::from_str(&timings.json().unwrap()).unwrap();
+        assert_eq!(saved["db_total_us"], before);
+        assert_eq!(saved["db_post_send_us"], 0);
+        assert_eq!(
+            saved["database"]["fanout_persist_total"]["elapsed_us"],
+            before
+        );
+    }
+
+    #[test]
     fn timings_include_queue_and_failed_stage_but_omit_unreached_stages() {
         let mut timings = CopyTimings::new(Instant::now() - Duration::from_millis(50));
         timings.stage("route_ms");
@@ -1703,6 +2004,7 @@ mod timing_tests {
 
 #[cfg(test)]
 mod unsupported_tests {
+    include!("latency_benchmark.rs");
     use super::*;
     use crate::{
         config::{HttpConfig, SizingConfig, TokenPolicyConfig},
@@ -1786,6 +2088,8 @@ mod unsupported_tests {
         use std::sync::atomic::AtomicBool;
         for scenario in [
             "overlap",
+            "submission_overlap",
+            "preparation_inflight",
             "limit",
             "insufficient",
             "send_error",
@@ -1804,7 +2108,7 @@ mod unsupported_tests {
                 "getBlockHeight" => json!(100),
                 // Deliberately keep reporting the pre-send balance: the reservation
                 // must protect funds even when processed RPC/cache data is stale.
-                "getBalance" => json!({"context":{"slot":42},"value":if matches!(scenario, "overlap" | "limit") {1_000_000_000} else {20_000_000}}),
+                "getBalance" => json!({"context":{"slot":42},"value":if matches!(scenario, "overlap" | "submission_overlap" | "preparation_inflight" | "limit") {1_000_000_000} else {20_000_000}}),
                 "getAccountInfo" => json!({"context":{"slot":42},"value":mint_account()}),
                 "getMultipleAccounts" => json!({"context":{"slot":42},"value":[mint_account(),mint_account()]}),
                 "getTokenAccountBalance" => json!({"context":{"slot":43},"value":{"amount":"1000","decimals":6,"uiAmount":0.001,"uiAmountString":"0.001"}}),
@@ -1820,6 +2124,7 @@ mod unsupported_tests {
                     sent.fetch_add(1, Ordering::SeqCst);
                     if scenario == "send_error" { json!({"error":{"code":-32000,"message":"ambiguous submission"}}) }
                     else if scenario == "signature_mismatch" { json!(Signature::new_unique().to_string()) }
+                    else if scenario == "submission_overlap" { json!({"test_result":transaction.signatures[0].to_string(),"test_delay_ms":1000}) }
                     else { json!(transaction.signatures[0].to_string()) }
                 }
                 "getSignatureStatuses" if !release.load(Ordering::SeqCst) => json!({"context":{"slot":43},"value":[null]}),
@@ -1837,6 +2142,9 @@ mod unsupported_tests {
                 minimum_input: "0.000001".into(),
                 maximum_input: "1".into(),
             };
+            if scenario == "submission_overlap" {
+                config.execution.max_concurrent_sends = 2;
+            }
             if scenario == "timeout" {
                 config.execution.confirmation_timeout_seconds = 0;
             }
@@ -1864,8 +2172,27 @@ mod unsupported_tests {
                 )),
             );
             let reservations = worker.reservations.clone();
+            let cleanup_worker = worker.shared_worker(0);
+            let held_preparation = if scenario == "preparation_inflight" {
+                Some(
+                    worker
+                        .lifecycle_slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
             let (sender, receiver) = tokio::sync::mpsc::channel(128);
-            for id in 1..=if scenario == "limit" { 65 } else { 2 } {
+            for id in 1..=if scenario == "limit" {
+                65
+            } else if scenario == "submission_overlap" {
+                4
+            } else {
+                2
+            } {
                 let observed = observation(wallet, id);
                 store.record_observation(&observed).await.unwrap();
                 sender
@@ -1883,7 +2210,7 @@ mod unsupported_tests {
             drop(sender);
             let task = tokio::spawn(worker.run(receiver));
             let expected_sends = match scenario {
-                "overlap" => 2,
+                "overlap" | "submission_overlap" | "preparation_inflight" => 2,
                 "limit" => 64,
                 _ => 1,
             };
@@ -1892,7 +2219,10 @@ mod unsupported_tests {
                     let rows = store.status(100).await.unwrap();
                     let skipped = rows.iter().any(|r| r.source_status == "skipped");
                     if sends.load(Ordering::SeqCst) == expected_sends
-                        && (matches!(scenario, "overlap" | "limit") || skipped)
+                        && (matches!(
+                            scenario,
+                            "overlap" | "submission_overlap" | "preparation_inflight" | "limit"
+                        ) || skipped)
                     {
                         break;
                     }
@@ -1901,9 +2231,27 @@ mod unsupported_tests {
             })
             .await
             .expect("next observation must progress while confirmation is blocked");
+            if scenario == "submission_overlap" {
+                // Both requests must launch while the first response is blocked.
+                // All four reservations show preparation proceeded independently.
+                tokio::time::timeout(Duration::from_millis(500), async {
+                    while reservations.lock().await.pending != 4 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("prepare subsequent copies before Sender responds");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                assert_eq!(sends.load(Ordering::SeqCst), 2, "submission cap must hold");
+            }
             if matches!(
                 scenario,
-                "overlap" | "limit" | "insufficient" | "failed_confirmation"
+                "overlap"
+                    | "submission_overlap"
+                    | "preparation_inflight"
+                    | "limit"
+                    | "insufficient"
+                    | "failed_confirmation"
             ) {
                 assert!(
                     !task.is_finished(),
@@ -1926,6 +2274,8 @@ mod unsupported_tests {
                 .unwrap();
             let expected_sends = if scenario == "limit" {
                 65
+            } else if scenario == "submission_overlap" {
+                4
             } else {
                 expected_sends
             };
@@ -1953,6 +2303,15 @@ mod unsupported_tests {
                 if !unknown && scenario != "failed_confirmation" {
                     assert!(timings["reconciliation_ms"].is_number());
                 }
+            }
+            if scenario == "preparation_inflight" {
+                assert_eq!(reservations.lock().await.pending, 0);
+                assert!(
+                    !reservations.lock().await.remaining.is_empty(),
+                    "preparation must keep the settled batch budget"
+                );
+                drop(held_preparation);
+                cleanup_worker.reset_idle_reservations().await;
             }
             let budget = reservations.lock().await;
             assert_eq!(budget.pending, 0);
@@ -2058,6 +2417,7 @@ mod unsupported_tests {
                 mainnet.fanout.nonce_accounts = vec![nonce_account.to_string()];
                 mainnet.fanout.routes = (0..2)
                     .map(|index| crate::config::FanoutRouteConfig {
+                        provider: crate::config::FanoutProvider::JsonRpc,
                         name: format!("route-{index}"),
                         url: server.url.clone(),
                         tip_account: Pubkey::new_unique().to_string(),
@@ -2379,6 +2739,7 @@ struct PendingCopy {
     output_account: Pubkey,
     local_signature: solana_sdk::signature::Signature,
     route_latency_ms: u64,
+    lifecycle_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 #[derive(Default)]
@@ -2413,3 +2774,5 @@ impl BalanceReservations {
         true
     }
 }
+
+include!("worker_pool.rs");

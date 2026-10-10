@@ -54,6 +54,24 @@ routes = []
 # tip_lamports = 5000
 # priority_fee_micro_lamports = 150000
 
+# [[mainnet.fanout.routes]]
+# name = "quicknode"
+# provider = "json_rpc"
+# url = "https://YOUR-ENDPOINT.solana-mainnet.quiknode.pro/YOUR-TOKEN/"
+# tip_account = "11111111111111111111111111111111"
+# tip_lamports = 0
+# priority_fee_micro_lamports = 100000
+
+# Default Helius RPC uses HELIUS_API_KEY at startup; no sender tip.
+# [[mainnet.fanout.routes]]
+# name = "default-rpc"
+# provider = "json_rpc"
+# url = "https://mainnet.helius-rpc.com/"
+# tip_account = "11111111111111111111111111111111"
+# tip_lamports = 0
+# priority_fee_micro_lamports = 100000
+#
+
 [storage]
 database_url = "sqlite://copy_trader.sqlite?mode=rwc"
 
@@ -63,6 +81,10 @@ allow_live_mainnet = false
 slippage_bps = 100
 max_signal_age_seconds = 30
 confirmation_timeout_seconds = 30
+# Parallel preparation lanes share wallet reservations and submission limits.
+preparation_workers = 4
+# Up to this many Sender calls overlap.
+max_concurrent_sends = 32
 
 [sizing]
 # Buy sizing; token-to-SOL exits mirror the source sold fraction of our holdings.
@@ -84,3 +106,32 @@ mode = "allowlist"
 mint = "So11111111111111111111111111111111111111112"
 minimum_input = "0.001"
 maximum_input = "0.05" # Larger sized copies are capped at this amount.
+
+# Add alongside other routes after configuring nonce accounts and enabling fanout.
+# BLOCKRAZOR_API_KEY comes from the environment or .env; never put it in the URL.
+# [[mainnet.fanout.routes]]
+# name = "newyork-blockrazor"
+# provider = "blockrazor"
+# url = "https://newyork.solana.blockrazor.io/sendTransaction"
+# tip_account = "Gywj98ophM7GmkDdaWs4isqZnDdFCW7B46TXmKfvyqSm"
+# tip_lamports = 100000
+# priority_fee_micro_lamports = 100000
+
+# NextBlock: set NEXTBLOCK_API_KEY, then enable with the other nonce routes.
+
+# [[mainnet.fanout.routes]]
+# name = "newyork-nextblock"
+# provider = "nextblock"
+# url = "https://ny.nextblock.io/api/v2/submit"
+# tip_account = "NextbLoCkVtMGcV47JzewQdvBpLqT9TxQFozQkN98pE"
+# tip_lamports = 1000000
+# priority_fee_micro_lamports = 100000
+
+# Astralane free-tier tip; authentication comes from ASTRALANE_API_KEY.
+# [[mainnet.fanout.routes]]
+# name = "newyork-astralane"
+# provider = "astralane"
+# url = "https://ny.gateway.astralane.io/iris"
+# tip_account = "astrazznxsGUhWShqgNtAdfrzP2G83DzcWVJDxwV9bF"
+# tip_lamports = 1000000
+# priority_fee_micro_lamports = 100000

@@ -113,7 +113,7 @@ pub struct MainnetConfig {
 }
 
 impl MainnetConfig {
-    /// Resolve only recognized Helius Sender endpoints. Other providers keep
+    /// Resolve recognized Helius RPC and Sender endpoints. Other providers keep
     /// their own authentication, and explicit real keys take precedence.
     pub fn with_helius_api_key(&self, api_key: &str) -> Result<Self> {
         validate_api_key(api_key)?;
@@ -121,6 +121,33 @@ impl MainnetConfig {
         inject_sender_api_key(&mut config.sender_url, api_key);
         for route in &mut config.fanout.routes {
             inject_sender_api_key(&mut route.url, api_key);
+        }
+        if config.fanout.enabled
+            && config
+                .fanout
+                .routes
+                .iter()
+                .any(|r| r.provider == FanoutProvider::Blockrazor)
+        {
+            crate::mainnet::blockrazor::api_key()?;
+        }
+        if config.fanout.enabled
+            && config
+                .fanout
+                .routes
+                .iter()
+                .any(|r| r.provider == FanoutProvider::Nextblock)
+        {
+            crate::mainnet::nextblock::api_key()?;
+        }
+        if config.fanout.enabled
+            && config
+                .fanout
+                .routes
+                .iter()
+                .any(|r| r.provider == FanoutProvider::Astralane)
+        {
+            crate::mainnet::astralane::api_key()?;
         }
         Ok(config)
     }
@@ -170,9 +197,21 @@ impl Default for FanoutConfig {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FanoutProvider {
+    #[default]
+    JsonRpc,
+    Blockrazor,
+    Nextblock,
+    Astralane,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FanoutRouteConfig {
+    #[serde(default)]
+    pub provider: FanoutProvider,
     pub name: String,
     pub url: Url,
     pub tip_account: String,
@@ -198,6 +237,11 @@ pub struct ExecutionConfig {
     pub max_signal_age_seconds: u64,
     #[serde(default = "default_confirmation_timeout")]
     pub confirmation_timeout_seconds: u64,
+    /// Maximum concurrent submission calls; settlement has a separate 64-copy bound.
+    #[serde(default = "default_max_concurrent_sends")]
+    pub max_concurrent_sends: usize,
+    #[serde(default = "default_preparation_workers")]
+    pub preparation_workers: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -271,6 +315,16 @@ impl AppConfig {
         if self.signal.queue_capacity == 0 {
             return Err(CopyTraderError::Configuration(
                 "signal.queue_capacity must be greater than zero".to_owned(),
+            ));
+        }
+        if !(1..=16).contains(&self.execution.preparation_workers) {
+            return Err(CopyTraderError::Configuration(
+                "execution.preparation_workers must be between 1 and 16".into(),
+            ));
+        }
+        if !(1..=64).contains(&self.execution.max_concurrent_sends) {
+            return Err(CopyTraderError::Configuration(
+                "execution.max_concurrent_sends must be between 1 and 64".to_owned(),
             ));
         }
         if self.execution.slippage_bps > 10_000 {
@@ -394,11 +448,11 @@ fn validate_sender(config: &MainnetConfig) -> Result<()> {
         use std::{collections::HashSet, str::FromStr};
         if fanout.nonce_accounts.is_empty()
             || fanout.routes.is_empty()
-            || fanout.routes.len() > 8
+            || fanout.routes.len() > 32
             || !(1..=10_000).contains(&fanout.submit_timeout_ms)
         {
             return Err(CopyTraderError::Configuration(
-                "fanout requires nonce accounts, 1–8 routes, and submit_timeout_ms in 1–10000"
+                "fanout requires nonce accounts, 1–32 routes, and submit_timeout_ms in 1–10000"
                     .into(),
             ));
         }
@@ -423,6 +477,55 @@ fn validate_sender(config: &MainnetConfig) -> Result<()> {
                 || Pubkey::from_str(&route.tip_account).is_err()
             {
                 return Err(CopyTraderError::Configuration("invalid fanout route: use unique names, HTTP(S) URLs, valid tip accounts, and priority fees within the maximum".into()));
+            }
+            if route.provider == FanoutProvider::Astralane {
+                let host = route.url.host_str().unwrap_or_default();
+                if !(host == "edge.astralane.io"
+                    || [
+                        "ny", "fr", "fr2", "la", "jp", "ams", "ams2", "lim", "sg", "lit", "lon",
+                    ]
+                    .iter()
+                    .any(|region| host == format!("{region}.gateway.astralane.io")))
+                    || route.url.scheme() != "https"
+                    || route.url.path() != "/iris"
+                    || route.url.query().is_some()
+                    || !route.url.username().is_empty()
+                    || route.url.password().is_some()
+                    || route.tip_lamports < 10_000
+                    || !crate::mainnet::astralane::TIP_ACCOUNTS
+                        .contains(&route.tip_account.as_str())
+                {
+                    return Err(CopyTraderError::Configuration("Astralane requires an official HTTPS /iris endpoint, no URL credentials, an Astralane tip account and at least 10000 tip lamports (actual minimum depends on tier)".into()));
+                }
+            }
+            if route.provider == FanoutProvider::Nextblock {
+                let host = route.url.host_str().unwrap_or_default();
+                if !host.ends_with(".nextblock.io")
+                    || route.url.path() != "/api/v2/submit"
+                    || route.url.query().is_some()
+                    || !route.url.username().is_empty()
+                    || route.url.password().is_some()
+                    || route.tip_lamports < 1_000_000
+                    || !crate::mainnet::nextblock::TIP_ACCOUNTS
+                        .contains(&route.tip_account.as_str())
+                {
+                    return Err(CopyTraderError::Configuration("NextBlock routes require an official /api/v2/submit endpoint, no URL credentials, a NextBlock tip account and at least 1000000 tip lamports".into()));
+                }
+            }
+            if route.provider == FanoutProvider::Blockrazor {
+                let host = route.url.host_str().unwrap_or_default();
+                if !(host.ends_with(".solana.blockrazor.xyz")
+                    || host.ends_with(".solana.blockrazor.io"))
+                    || route.url.path() != "/sendTransaction"
+                    || route.url.query().is_some()
+                    || !route.url.username().is_empty()
+                    || route.url.password().is_some()
+                    || route.tip_lamports < 100_000
+                    || !crate::mainnet::blockrazor::TIP_ACCOUNTS
+                        .contains(&route.tip_account.as_str())
+                {
+                    return Err(CopyTraderError::Configuration("BlockRazor routes require an official Solana /sendTransaction endpoint, no URL credentials, a BlockRazor tip account and at least 100000 tip lamports".into()));
+                }
             }
             if route.url.host_str().is_some_and(|host| {
                 host == "sender.helius-rpc.com" || host.ends_with("-sender.helius-rpc.com")
@@ -515,6 +618,7 @@ fn inject_sender_api_key(url: &mut Url, api_key: &str) {
         url.host_str(),
         Some(
             "sender.helius-rpc.com"
+                | "mainnet.helius-rpc.com"
                 | "slc-sender.helius-rpc.com"
                 | "ewr-sender.helius-rpc.com"
                 | "lon-sender.helius-rpc.com"
@@ -630,12 +734,130 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nextblock_routes_validate_endpoint_and_tip_wallet() {
+        let mut config = AppConfig::load(Path::new("config.example.toml"))
+            .unwrap()
+            .mainnet
+            .unwrap();
+        config.fanout.enabled = true;
+        config.fanout.nonce_accounts = vec![Pubkey::new_unique().to_string()];
+        let route = FanoutRouteConfig {
+            provider: FanoutProvider::Nextblock,
+            name: "nextblock".into(),
+            url: Url::parse("https://ny.nextblock.io/api/v2/submit").unwrap(),
+            tip_account: crate::mainnet::nextblock::TIP_ACCOUNTS[0].into(),
+            tip_lamports: 1000000,
+            priority_fee_micro_lamports: 100000,
+        };
+        config.fanout.routes = vec![route.clone()];
+        validate_sender(&config).unwrap();
+        for endpoint in [
+            "https://evil.example/api/v2/submit",
+            "https://ny.nextblock.io/other",
+            "https://ny.nextblock.io/api/v2/submit?key=secret",
+        ] {
+            config.fanout.routes[0].url = Url::parse(endpoint).unwrap();
+            assert!(validate_sender(&config).is_err());
+        }
+        config.fanout.routes[0] = route;
+        config.fanout.routes[0].tip_account = Pubkey::new_unique().to_string();
+        assert!(validate_sender(&config).is_err());
+    }
+
+    #[test]
+    fn blockrazor_routes_validate_endpoints_tips_and_legacy_provider() {
+        let mut config = AppConfig::load(Path::new("config.example.toml"))
+            .unwrap()
+            .mainnet
+            .unwrap();
+        config.fanout.enabled = true;
+        config.fanout.nonce_accounts = vec![Pubkey::new_unique().to_string()];
+        let route = FanoutRouteConfig {
+            provider: FanoutProvider::Blockrazor,
+            name: "blockrazor".into(),
+            url: Url::parse("https://newyork.solana.blockrazor.io/sendTransaction").unwrap(),
+            tip_account: crate::mainnet::blockrazor::TIP_ACCOUNTS[0].into(),
+            tip_lamports: 100000,
+            priority_fee_micro_lamports: 100000,
+        };
+        config.fanout.routes = vec![route.clone()];
+        validate_sender(&config).unwrap();
+        for endpoint in [
+            "https://evil.example/sendTransaction",
+            "https://newyork.solana.blockrazor.io/other",
+            "https://newyork.solana.blockrazor.io/sendTransaction?api-key=secret",
+            "https://user:secret@newyork.solana.blockrazor.io/sendTransaction",
+        ] {
+            config.fanout.routes[0].url = Url::parse(endpoint).unwrap();
+            assert!(validate_sender(&config).is_err());
+        }
+        config.fanout.routes[0] = route.clone();
+        config.fanout.routes[0].tip_lamports = 99999;
+        assert!(validate_sender(&config).is_err());
+        config.fanout.routes[0] = route;
+        config.fanout.routes[0].tip_account = Pubkey::new_unique().to_string();
+        assert!(validate_sender(&config).is_err());
+        let legacy: FanoutRouteConfig = toml::from_str("name = 'old'\nurl = 'https://sender.helius-rpc.com/fast'\ntip_account = '11111111111111111111111111111111'\ntip_lamports = 5000\npriority_fee_micro_lamports = 100000").unwrap();
+        assert_eq!(legacy.provider, FanoutProvider::JsonRpc);
+    }
+
+    #[test]
+    fn preparation_worker_limits_and_legacy_defaults() {
+        let text = std::fs::read_to_string("config.example.toml").unwrap();
+        let legacy = text
+            .lines()
+            .filter(|line| {
+                !line.starts_with("preparation_workers =")
+                    && !line.starts_with("max_concurrent_sends =")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut config: AppConfig = toml::from_str(&legacy).unwrap();
+        assert_eq!(config.execution.preparation_workers, 4);
+        assert_eq!(config.execution.max_concurrent_sends, 8);
+        for count in [1, 4, 16] {
+            config.execution.preparation_workers = count;
+            config.validate().unwrap();
+        }
+        for count in [0, 17, usize::MAX] {
+            config.execution.preparation_workers = count;
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("preparation_workers")
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_submission_limits_are_bounded() {
+        let mut config = AppConfig::load(Path::new("config.example.toml")).unwrap();
+        for limit in [1, 8, 64] {
+            config.execution.max_concurrent_sends = limit;
+            config.validate().expect("supported concurrency");
+        }
+        for limit in [0, 65, usize::MAX] {
+            config.execution.max_concurrent_sends = limit;
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("max_concurrent_sends")
+            );
+        }
+    }
+
+    #[test]
     fn sender_urls_use_environment_key_without_leaking_it_to_other_hosts() {
         let base = AppConfig::load(Path::new("config.example.toml"))
             .unwrap()
             .mainnet
             .unwrap();
         for endpoint in [
+            "https://mainnet.helius-rpc.com/",
             "https://sender.helius-rpc.com/fast?swqos_only=true",
             "http://ewr-sender.helius-rpc.com/fast?api-key=YOUR_HELIUS_API_KEY&swqos_only=true",
             "https://tyo-sender.helius-rpc.com/fast?api-key=",
@@ -643,6 +865,7 @@ mod tests {
             let mut config = base.clone();
             config.sender_url = Url::parse(endpoint).unwrap();
             config.fanout.routes = vec![FanoutRouteConfig {
+                provider: crate::config::FanoutProvider::JsonRpc,
                 name: "route".into(),
                 url: config.sender_url.clone(),
                 tip_account: Pubkey::new_unique().to_string(),
@@ -657,7 +880,7 @@ mod tests {
                     .map(|(_, value)| value.into_owned())
                     .collect::<Vec<_>>();
                 assert_eq!(keys, vec!["env+key&value"]);
-                assert_eq!(url.path(), "/fast");
+                assert_eq!(url.path(), Url::parse(endpoint).unwrap().path());
                 if endpoint.contains("swqos_only") {
                     assert!(
                         url.query_pairs()
@@ -680,6 +903,7 @@ mod tests {
             let mut config = base.clone();
             config.sender_url = Url::parse(endpoint).unwrap();
             config.fanout.routes = vec![FanoutRouteConfig {
+                provider: crate::config::FanoutProvider::JsonRpc,
                 name: "route".into(),
                 url: config.sender_url.clone(),
                 tip_account: Pubkey::new_unique().to_string(),
@@ -701,6 +925,7 @@ mod tests {
         assert!(validate_sender(mainnet).is_err());
         mainnet.fanout.nonce_accounts = vec![Pubkey::new_unique().to_string()];
         mainnet.fanout.routes = vec![FanoutRouteConfig {
+            provider: crate::config::FanoutProvider::JsonRpc,
             name: "sender".into(),
             url: mainnet.sender_url.clone(),
             tip_account: "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE".into(),
@@ -989,4 +1214,12 @@ mod tests {
             .is_err()
         );
     }
+}
+
+const fn default_max_concurrent_sends() -> usize {
+    8
+}
+
+const fn default_preparation_workers() -> usize {
+    4
 }
