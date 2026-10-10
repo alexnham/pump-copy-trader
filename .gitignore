@@ -7,3 +7,5 @@
 /*.sqlite*
 __pycache__/
 *.pyc
+
+/config.frankfurt.toml

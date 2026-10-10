@@ -135,6 +135,23 @@ pub(crate) fn copy_source_instruction(
             "unsupported Pump.fun bonding-curve instruction".to_owned(),
         ));
     }
+    // A native wallet delta can include a wrapper's quote-token conversion.
+    // Copying only its Pump instruction cannot reproduce that funding leg.
+    if source
+        .instruction
+        .data
+        .get(..8)
+        .is_some_and(|d| d == BUY_V2_DISCRIMINATOR || d == BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR)
+        && source
+            .instruction
+            .accounts
+            .get(2)
+            .is_some_and(|a| a.pubkey != Pubkey::from_str_const(NATIVE_MINT))
+    {
+        return Err(CopyTraderError::Unsupported(
+            "Pump.fun V2 quote-token buy requires a funding conversion; cannot copy it as native SOL".into(),
+        ));
+    }
     let output_mint = trade.intent.output_asset.routing_mint();
     let output_program = source
         .wallet_token_accounts
