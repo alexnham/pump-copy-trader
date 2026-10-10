@@ -175,6 +175,16 @@ impl ExecutionWorker {
             timings
                 .values
                 .insert("preconfirmation", u64::from(preconfirmation));
+            timings.values.insert(
+                "preconfirmation_status_unknown",
+                u64::from(
+                    preconfirmation && queued.observed.meta.preconfirmation_status == Some(2),
+                ),
+            );
+            timings.values.insert(
+                "terminal_preconfirmation",
+                u64::from(preconfirmation && crate::decode::terminal::present(&queued.observed)),
+            );
             timings.values.insert("queue_wait_us", queue_wait_us);
             timings
                 .values
@@ -357,7 +367,7 @@ impl ExecutionWorker {
         intent_write?;
         let InitialReads {
             input_info,
-            output_info,
+            output_token_program,
             native_balance,
             mint_read_ms,
             mint_from_source,
@@ -598,11 +608,8 @@ impl ExecutionWorker {
         timings.stage("post_route_ms");
 
         let post_route_started = Instant::now();
-        let output_account = associated_token_address(
-            &self.signer.pubkey(),
-            &output_mint,
-            &output_info.token_program,
-        );
+        let output_account =
+            associated_token_address(&self.signer.pubkey(), &output_mint, &output_token_program);
         let serialization_started = Instant::now();
         let signed = bincode::serialize(&winner.transaction).map_err(|error| {
             CopyTraderError::Execution(format!("failed to serialize signed transaction: {error}"))
@@ -1138,7 +1145,20 @@ impl ExecutionWorker {
                             .token_safety
                             .source_info(intent.output_asset.routing_mint(), infos.1)
                             .await?;
-                        return Ok(((input, output), 0, true));
+                        return Ok(((input, output.token_program), 0, true));
+                    }
+                    if intent.input_asset == AssetId::NativeSol {
+                        if let Some(program) = source_output_program(intent) {
+                            let output_program = self
+                                .token_safety
+                                .source_program_info(intent.output_asset.routing_mint(), program)
+                                .await?;
+                            return Ok((
+                                (crate::token::extensions::native_mint_info(), output_program),
+                                0,
+                                true,
+                            ));
+                        }
                     }
                     let started = Instant::now();
                     let infos = self
@@ -1148,7 +1168,11 @@ impl ExecutionWorker {
                             intent.output_asset.routing_mint(),
                         )
                         .await?;
-                    Ok::<_, CopyTraderError>((infos, CopyTimings::millis(started.elapsed()), false))
+                    Ok::<_, CopyTraderError>((
+                        (infos.0, infos.1.token_program),
+                        CopyTimings::millis(started.elapsed()),
+                        false,
+                    ))
                 },
                 async {
                     if matches!(intent.input_asset, AssetId::NativeSol) {
@@ -1168,12 +1192,12 @@ impl ExecutionWorker {
             )
         };
         let (
-            ((input_info, output_info), mint_read_ms, mint_from_source),
+            ((input_info, output_token_program), mint_read_ms, mint_from_source),
             (native_balance, balance_metrics),
         ) = preparation.await?;
         Ok(InitialReads {
             input_info,
-            output_info,
+            output_token_program,
             native_balance,
             mint_read_ms,
             mint_from_source,
@@ -1336,11 +1360,45 @@ fn source_position_before(
 
 struct InitialReads {
     input_info: MintInfo,
-    output_info: MintInfo,
+    output_token_program: Pubkey,
     native_balance: Option<u64>,
     mint_read_ms: u64,
     mint_from_source: bool,
     balance_metrics: std::collections::BTreeMap<&'static str, u64>,
+}
+
+fn source_output_program(intent: &TradeIntent) -> Option<Pubkey> {
+    if intent.input_asset != AssetId::NativeSol || !matches!(intent.output_asset, AssetId::Token(_))
+    {
+        return None;
+    }
+    let source = intent.source_instruction.as_ref()?;
+    if ![
+        pump_fun::PROGRAM_ID,
+        crate::domain::DexKind::PumpSwap.program_id(),
+    ]
+    .contains(&source.instruction.program_id)
+    {
+        return None;
+    }
+    let mint = intent.output_asset.routing_mint();
+    let mut matches = source
+        .wallet_token_accounts
+        .iter()
+        .filter(|(_, known, _)| *known == mint);
+    let (address, _, program) = matches.next()?;
+    if matches.next().is_some()
+        || ![spl_token::id(), spl_token_2022::id()].contains(program)
+        || *address != associated_token_address(&source.source_wallet, &mint, program)
+        || !source
+            .instruction
+            .accounts
+            .iter()
+            .any(|meta| meta.pubkey == *address)
+    {
+        return None;
+    }
+    Some(*program)
 }
 
 fn direct_source_mints(
@@ -1563,6 +1621,7 @@ mod timing_tests {
         let mint = Pubkey::new_unique();
         let ata = associated_token_address(&wallet, &mint, &spl_token::id());
         let source = crate::domain::SourceInstruction {
+            minimum_output_override: None,
             instruction: Instruction {
                 program_id: pump_fun::PROGRAM_ID,
                 accounts: vec![AccountMeta::new(ata, false)],
@@ -1632,6 +1691,7 @@ mod timing_tests {
                 address: Pubkey::new_unique(),
             }),
             source_instruction: Some(crate::domain::SourceInstruction {
+                minimum_output_override: None,
                 instruction: Instruction {
                     program_id: crate::domain::DexKind::PumpSwap.program_id(),
                     accounts: vec![AccountMeta::new(ata, false)],
@@ -2344,7 +2404,15 @@ mod unsupported_tests {
     }
     #[tokio::test]
     async fn preconfirmation_copies_once_and_route_failures_allow_processed_fallback() {
-        for scenario in ["early", "route_failure", "processed_first", "fanout"] {
+        for scenario in [
+            "early",
+            "bam",
+            "terminal",
+            "terminal_bam",
+            "route_failure",
+            "processed_first",
+            "fanout",
+        ] {
             let signer = Arc::new(Keypair::new());
             let authority = signer.pubkey();
             let nonce_account = Pubkey::new_unique();
@@ -2382,8 +2450,14 @@ mod unsupported_tests {
                         *selected_signature.lock().unwrap() = transaction.signatures[0].to_string();
                     }
                     let swap = transaction.message.instructions.iter().find(|ix| transaction.message.account_keys[ix.program_id_index as usize] == pump_fun::PROGRAM_ID).unwrap();
-                    let output_index = swap.accounts[5];
-                    let mint = transaction.message.account_keys[swap.accounts[2] as usize];
+                    let modern = scenario.starts_with("terminal");
+                    if modern {
+                        assert_eq!(&swap.data[..8], &pump_fun::BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR);
+                        assert_eq!(u64::from_le_bytes(swap.data[8..16].try_into().unwrap()), 1_000_000);
+                        assert_eq!(u64::from_le_bytes(swap.data[16..24].try_into().unwrap()), 1);
+                    }
+                    let output_index = swap.accounts[if modern {14} else {5}];
+                    let mint = transaction.message.account_keys[swap.accounts[if modern {1} else {2}] as usize];
                     *landed.lock().unwrap() = json!({"transaction":{"message":{"accountKeys":transaction.message.account_keys.iter().map(ToString::to_string).collect::<Vec<_>>() }},
                         "meta":{"err":null,"preTokenBalances":[],"postTokenBalances":[{"accountIndex":output_index,"mint":mint.to_string(),"uiTokenAmount":{"amount":"1000"}}]}});
                     if scenario == "fanout" { json!({"error":{"code":-32000,"message":"second variant landed but acknowledgment lost"}}) }
@@ -2410,6 +2484,12 @@ mod unsupported_tests {
                 minimum_input: "0.000001".into(),
                 maximum_input: "1".into(),
             };
+            if scenario.starts_with("terminal") {
+                config.signal.wallet = crate::decode::terminal::tests::observation(
+                    &crate::decode::terminal::tests::fixtures()[0],
+                )
+                .1;
+            }
             let mainnet = config.mainnet.as_mut().unwrap();
             mainnet.sender_url = server.url.clone();
             if scenario == "fanout" {
@@ -2469,13 +2549,25 @@ mod unsupported_tests {
             message.instructions[0].data[16..24].copy_from_slice(&10_000_000_u64.to_le_bytes());
             let mut early = processed.clone();
             early.origin = SignalOrigin::Preconfirmation;
-            early.meta = TransactionMeta::default();
+            early.meta = TransactionMeta {
+                preconfirmation_status: Some(if scenario == "bam" { 2 } else { 1 }),
+                ..Default::default()
+            };
             if scenario == "route_failure" {
                 let VersionedMessage::Legacy(message) = &mut early.transaction.message else {
                     unreachable!()
                 };
                 message.instructions[0].data[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
                 message.instructions[0].data[16..24].copy_from_slice(&1_u64.to_le_bytes());
+            }
+            if scenario.starts_with("terminal") {
+                early = crate::decode::terminal::tests::observation(
+                    &crate::decode::terminal::tests::fixtures()[0],
+                )
+                .0;
+                early.meta.preconfirmation_status =
+                    Some(if scenario == "terminal_bam" { 2 } else { 1 });
+                processed.signature = early.signature;
             }
             let signature = processed.signature.to_string();
             let observations = if scenario == "processed_first" {
@@ -2526,8 +2618,24 @@ mod unsupported_tests {
             let timing: serde_json::Value =
                 serde_json::from_str(rows[0].timings_json.as_ref().unwrap()).unwrap();
             assert_eq!(
+                timing["preconfirmation_status_unknown"],
+                u64::from(matches!(scenario, "bam" | "terminal_bam")),
+                "{scenario}"
+            );
+            assert_eq!(
+                timing["terminal_preconfirmation"],
+                u64::from(scenario.starts_with("terminal")),
+                "{scenario}"
+            );
+            assert_eq!(timing["mint_read_ms"], 0, "{scenario}");
+            assert_eq!(timing["mint_from_source"], 1, "{scenario}");
+            assert_eq!(server.count("getMultipleAccounts"), 0, "{scenario}");
+            assert_eq!(
                 timing["preconfirmation"],
-                if matches!(scenario, "early" | "fanout") {
+                if matches!(
+                    scenario,
+                    "early" | "bam" | "terminal" | "terminal_bam" | "fanout"
+                ) {
                     1
                 } else {
                     0

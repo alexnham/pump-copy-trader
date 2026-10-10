@@ -37,6 +37,8 @@ pub struct ObservedTransaction {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransactionMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preconfirmation_status: Option<u8>,
     #[serde(skip)]
     pub live_inner_instructions:
         Option<Vec<solana_sdk::message::compiled_instruction::CompiledInstruction>>,

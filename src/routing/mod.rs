@@ -323,6 +323,24 @@ impl Router {
 }
 
 fn source_outputs(trade: &SizedTrade, slippage_bps: u16) -> Result<(u64, u64)> {
+    if let Some(source) = &trade.intent.source_instruction
+        && let Some(minimum) = source.minimum_output_override
+    {
+        if minimum != 1
+            || trade.input_amount == 0
+            || trade.intent.input_asset != crate::domain::AssetId::NativeSol
+            || source.instruction.program_id != pump_fun::PROGRAM_ID
+            || source.instruction.data.get(..8)
+                != Some(pump_fun::BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR.as_slice())
+        {
+            return Err(CopyTraderError::Execution(
+                "invalid early output floor override".into(),
+            ));
+        }
+        // This is a source instruction floor, not a price quote or predicted fill.
+        return Ok((minimum, minimum));
+    }
+
     let expected = u128::from(trade.input_amount)
         .checked_mul(u128::from(trade.intent.source_output_amount))
         .and_then(|value| value.checked_div(u128::from(trade.intent.source_input_amount)))

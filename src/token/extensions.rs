@@ -130,8 +130,32 @@ impl TokenSafetyClient {
     }
 
     pub async fn source_info(&self, mint: Pubkey, assumed: MintInfo) -> Result<MintInfo> {
+        Ok(self
+            .source_metadata(mint, assumed.token_program, Some(assumed.decimals))
+            .await?
+            .unwrap_or(assumed))
+    }
+
+    /// Raw-amount buys need the source token program, not output decimals.
+    /// Inspect unseen mints in the background, as on the processed fast path.
+    pub async fn source_program_info(&self, mint: Pubkey, token_program: Pubkey) -> Result<Pubkey> {
+        if ![spl_token::id(), spl_token_2022::id()].contains(&token_program) {
+            return Err(CopyTraderError::Unsupported(
+                "unsupported source token program".into(),
+            ));
+        }
+        self.source_metadata(mint, token_program, None).await?;
+        Ok(token_program)
+    }
+
+    async fn source_metadata(
+        &self,
+        mint: Pubkey,
+        token_program: Pubkey,
+        decimals: Option<u8>,
+    ) -> Result<Option<MintInfo>> {
         if is_native_mint(&mint) {
-            return Ok(native_mint_info());
+            return Ok(Some(native_mint_info()));
         }
         let mut cache = self.background.lock().await;
         // Expire the requested mint immediately, and amortize whole-cache sweeps.
@@ -153,19 +177,19 @@ impl TokenSafetyClient {
         if let Some(entry) = cache.get(&mint) {
             return match &entry.result {
                 Some(Ok(info))
-                    if info.decimals != assumed.decimals
-                        || info.token_program != assumed.token_program =>
+                    if decimals.is_some_and(|value| info.decimals != value)
+                        || info.token_program != token_program =>
                 {
                     Err(CopyTraderError::Execution(format!(
                         "source mint metadata disagrees with inspected mint {mint}"
                     )))
                 }
-                Some(Ok(info)) => Ok(info.clone()),
+                Some(Ok(info)) => Ok(Some(info.clone())),
                 Some(Err(error)) => Err(CopyTraderError::OutOfScope(
                     crate::domain::UnsupportedReason::UnsupportedToken,
                     error.clone(),
                 )),
-                None => Ok(assumed),
+                None => Ok(None),
             };
         }
         let started = Instant::now();
@@ -225,7 +249,7 @@ impl TokenSafetyClient {
                 }
             }
         });
-        Ok(assumed)
+        Ok(None)
     }
 
     fn validate_mint(mint: &Pubkey, account: solana_sdk::account::Account) -> Result<MintInfo> {
@@ -467,6 +491,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_output_program_does_not_wait_and_reuses_background_rejection() {
+        use crate::{
+            config::HttpConfig,
+            test_rpc::{TestRpc, mint_account},
+        };
+        use serde_json::json;
+        let server = TestRpc::start(|request| {
+            assert_eq!(request["method"], "getAccountInfo");
+            let mut account = mint_account();
+            account["owner"] = json!(Pubkey::default().to_string());
+            json!({"test_delay_ms":150,"test_result":{"context":{"slot":42},"value":account}})
+        })
+        .await;
+        let transport = HttpTransport::new(&HttpConfig::default()).unwrap();
+        let client = TokenSafetyClient::new(&server.url, &transport);
+        let mint = Pubkey::new_unique();
+        let info = MintInfo {
+            decimals: 6,
+            token_program: spl_token_2022::id(),
+            has_transfer_fee: false,
+        };
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            client.source_program_info(mint, info.token_program),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        client
+            .source_program_info(mint, info.token_program)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if client
+                    .background
+                    .lock()
+                    .await
+                    .get(&mint)
+                    .is_some_and(|entry| entry.result.is_some())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            client
+                .source_program_info(mint, info.token_program)
+                .await
+                .is_err()
+        );
+        assert_eq!(server.count("getAccountInfo"), 1);
+    }
+
+    #[tokio::test]
     async fn background_metadata_mismatch_is_rejected() {
         use crate::{
             config::HttpConfig,
@@ -625,6 +707,47 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn raw_output_program_does_not_invent_decimals() {
+        use crate::{config::HttpConfig, test_rpc::TestRpc};
+        let server = TestRpc::start(|_| panic!("cached metadata must not fetch RPC")).await;
+        let client = TokenSafetyClient::new(
+            &server.url,
+            &HttpTransport::new(&HttpConfig::default()).unwrap(),
+        );
+        let mint = Pubkey::new_unique();
+        let info = MintInfo {
+            decimals: 8,
+            token_program: spl_token_2022::id(),
+            has_transfer_fee: true,
+        };
+        client.background.lock().await.insert(
+            mint,
+            BackgroundMint {
+                started: Instant::now(),
+                result: Some(Ok(info.clone())),
+            },
+        );
+        assert_eq!(
+            client
+                .source_program_info(mint, info.token_program)
+                .await
+                .unwrap(),
+            info.token_program
+        );
+        assert!(
+            client
+                .source_program_info(mint, spl_token::id())
+                .await
+                .is_err()
+        );
+        let assumed = MintInfo {
+            decimals: 6,
+            ..info
+        };
+        assert!(client.source_info(mint, assumed).await.is_err());
     }
 
     #[test]

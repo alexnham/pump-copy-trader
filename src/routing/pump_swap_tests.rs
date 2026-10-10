@@ -37,6 +37,7 @@ fn pump_swap_source_copy_rewrites_wallet_accounts_and_amounts() {
         let source_output_ata =
             associated_token_address(&source_wallet, &output_mint, &spl_token::id());
         let instruction = SourceInstruction {
+            minimum_output_override: None,
             instruction: Instruction {
                 program_id: DexKind::PumpSwap.program_id(),
                 accounts: vec![
@@ -135,6 +136,7 @@ fn pump_swap_source_copy_supports_native_buy_and_sell() {
             source_ata
         };
         let source_instruction = SourceInstruction {
+            minimum_output_override: None,
             instruction: Instruction {
                 program_id: DexKind::PumpSwap.program_id(),
                 accounts: vec![
@@ -358,6 +360,7 @@ async fn source_build_keeps_wsol_open_without_account_reads() {
             [102, 6, 61, 18, 1, 218, 235, 234]
         };
         let source = SourceInstruction {
+            minimum_output_override: None,
             instruction: Instruction {
                 program_id: DexKind::PumpSwap.program_id(),
                 accounts,
@@ -514,6 +517,7 @@ fn recorded_pumpswap_native_routes_fit_wire_limit() {
         let base = instruction.accounts[3].pubkey;
         let quote = instruction.accounts[4].pubkey;
         let source = SourceInstruction {
+            minimum_output_override: None,
             wallet_token_accounts: vec![
                 (
                     instruction.accounts[5].pubkey,

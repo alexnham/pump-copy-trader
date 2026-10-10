@@ -1,3 +1,4 @@
+mod diagnostics;
 mod laserstream;
 mod lookup_cache;
 mod payload;

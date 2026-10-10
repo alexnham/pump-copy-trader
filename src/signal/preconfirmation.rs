@@ -1,3 +1,4 @@
+use super::diagnostics::Counter;
 use super::{QueuedObservation, SignalSource, lookup_cache::LookupCache};
 use crate::domain::signal::SourceV1Config;
 use crate::{
@@ -39,6 +40,7 @@ pub struct PreconfirmationSource {
     wallet: Pubkey,
     store: Store,
     lookups: LookupCache,
+    observation_only: bool,
 }
 impl PreconfirmationSource {
     pub(crate) fn new(
@@ -64,12 +66,33 @@ impl PreconfirmationSource {
             wallet,
             store,
             lookups,
+            observation_only: false,
         }
     }
+    pub(crate) async fn diagnose(mut self, seconds: u64) -> Result<()> {
+        self.observation_only = true;
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let diagnostics = self.lookups.1.clone();
+        tokio::select! {
+            result = self.run(sender) => result?,
+            _ = time::sleep(Duration::from_secs(seconds)) => {}
+        }
+        let snapshot = diagnostics.snapshot();
+        println!(
+            "{}",
+            serde_json::json!({"wallet": self.wallet.to_string(), "seconds": seconds, "diagnostics": snapshot})
+        );
+        std::fs::write(
+            "/tmp/pump-copy-preconfirmation-probe.json",
+            snapshot.to_string(),
+        )?;
+        Ok(())
+    }
     fn request(&self) -> Value {
-        json!({"jsonrpc":"2.0", "id":SUBSCRIPTION_ID, "method":"preconfSubscribe",
-            "params":[{"includeBam":false,"failed":false,"accountInclude":[self.wallet.to_string()],
-                "signerInclude":[self.wallet.to_string()]}]})
+        // Receive both sources and filter known failures before execution.
+        let filter = json!({"includeBam":true,"accountInclude":[self.wallet.to_string()],
+            "signerInclude":[self.wallet.to_string()]});
+        json!({"jsonrpc":"2.0", "id":SUBSCRIPTION_ID, "method":"preconfSubscribe", "params":[filter]})
     }
     async fn connect(&self) -> Result<Socket> {
         let mut config = WebSocketConfig::default();
@@ -130,15 +153,28 @@ impl PreconfirmationSource {
     }
     async fn session(&self, output: &Sender<QueuedObservation>) -> Result<()> {
         let mut socket = self.connect().await?;
-        info!("preconfirmation stream subscribed (successful Helius executions)");
+        self.lookups.1.increment(Counter::Subscriptions);
+        info!(wallet = %self.wallet, include_bam = true, all_statuses = true, "preconfirmation stream subscribed");
         let decoder = TransactionDecoder::new(self.wallet);
         let mut heartbeat = time::interval(Duration::from_secs(30));
         heartbeat.tick().await;
+        let mut diagnostics_tick = time::interval(Duration::from_secs(30));
+        diagnostics_tick.tick().await;
         let mut pong_deadline = None;
         loop {
             let deadline =
                 pong_deadline.unwrap_or_else(|| time::Instant::now() + Duration::from_secs(3600));
             tokio::select! {
+                _ = diagnostics_tick.tick() => {
+                    let diagnostics = self.lookups.1.snapshot();
+                    info!(%diagnostics, "preconfirmation diagnostics");
+                    let observation_only = self.observation_only;
+                    tokio::task::spawn_blocking(move || {
+                        let path = if observation_only { "/tmp/pump-copy-preconfirmation-probe.json" } else { "/tmp/pump-copy-preconfirmation-diagnostics.json" };
+                        let temp = format!("{path}.tmp");
+                        if std::fs::write(&temp, diagnostics.to_string()).is_ok() { let _ = std::fs::rename(&temp, path); }
+                    });
+                }
                 _ = output.closed() => { let _ = socket.close(None).await; return Ok(()); }
                 _ = time::sleep_until(deadline), if pong_deadline.is_some() =>
                     return Err(signal_error("preconfirmation heartbeat timed out")),
@@ -152,29 +188,47 @@ impl PreconfirmationSource {
                     match message.ok_or_else(|| signal_error("preconfirmation stream ended"))?
                         .map_err(|_| signal_error("preconfirmation stream read failed"))? {
                         WsMessage::Binary(frame) => {
+                            self.lookups.1.increment(Counter::BinaryReceived);
+                            if frame.len() >= 19 && frame[0] == 1 {
+                                match frame[17] {
+                                    2 => self.lookups.1.increment(Counter::UnknownStatusReceived),
+                                    0 => self.lookups.1.increment(Counter::FailedStatusReceived),
+                                    _ => {}
+                                }
+                            }
                             let decode_started = Instant::now();
                             let observed = match decode_frame(&frame, &self.lookups) {
                                 Ok(Some(observed)) => observed,
-                                Ok(None) => continue,
-                                Err(error) => { warn!(%error, "invalid preconfirmation discarded"); continue; }
+                                Ok(None) => {
+                                    self.lookups.1.increment(if frame.get(17) == Some(&1) { Counter::LookupCacheMisses } else { Counter::StatusIgnored });
+                                    continue;
+                                },
+                                Err(error) => { self.lookups.1.increment(Counter::InvalidFrames); warn!(%error, "invalid preconfirmation discarded"); continue; }
                             };
+                            self.lookups.1.observe(observed.signature, true);
                             // Unsupported early signals must not create a durable unsupported
                             // classification or prevent the later processed signal from trading.
                             if let Err(error) = decoder.decode(&observed) {
-                                debug!(%error, "preconfirmation deferred to processed stream");
+                                let reason = error.to_string();
+                                self.lookups.1.increment(if reason.contains("wrapper requires") { Counter::WrapperRejections } else if reason.contains("sell requires") { Counter::SellRejections } else { Counter::OtherDecodeRejections });
+                                if crate::decode::terminal::present(&observed) { info!(signature = %observed.signature, %error, "Terminal preconfirmation deferred to processed stream"); } else { debug!(%error, "preconfirmation deferred to processed stream"); }
                                 continue;
                             }
+                            self.lookups.1.increment(Counter::Ready);
+                            if self.observation_only { continue; }
                             let payload_decode_us = micros(decode_started.elapsed());
                             let permit = match output.try_reserve() {
                                 Ok(permit) => permit,
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    self.lookups.1.increment(Counter::QueueFull);
                                     warn!("preconfirmation queue full; deferring to processed stream"); continue;
                                 }
                                 Err(_) => return Ok(()),
                             };
                             let enqueue_started = Instant::now();
                             let database_timings = DatabaseTimings::default();
-                            if !self.store.with_timings(database_timings.clone()).record_observation(&observed).await? { continue; }
+                            if !self.store.with_timings(database_timings.clone()).record_observation(&observed).await? { self.lookups.1.increment(Counter::Duplicate); continue; }
+                            self.lookups.1.increment(Counter::Enqueued);
                             permit.send(QueuedObservation {
                                 observed, received_at, queued_at: Instant::now(), payload_decode_us,
                                 observation_enqueue_us: micros(enqueue_started.elapsed()), database_timings,
@@ -202,6 +256,7 @@ impl SignalSource for PreconfirmationSource {
                 return Ok(());
             }
             if let Err(error) = result {
+                self.lookups.1.increment(Counter::Reconnects);
                 warn!(%error, retry_seconds = backoff.as_secs(), "preconfirmation stream unavailable; LaserStream remains active");
             }
             if started.elapsed() > Duration::from_secs(60) {
@@ -227,8 +282,8 @@ fn decode_frame(frame: &[u8], lookups: &LookupCache) -> Result<Option<ObservedTr
         return Err(signal_error("unsupported preconfirmation schema version"));
     }
     match frame[17] {
-        0 | 2 => return Ok(None), // Failed and unknown status never trigger execution.
-        1 => {}
+        0 => return Ok(None), // Known failures never trigger execution.
+        1 | 2 => {}
         _ => return Err(signal_error("invalid preconfirmation status")),
     }
     let slot = u64::from_le_bytes(frame[1..9].try_into().expect("checked header"));
@@ -242,7 +297,7 @@ fn decode_frame(frame: &[u8], lookups: &LookupCache) -> Result<Option<ObservedTr
             max_accounts_per_instruction: 256,
         },
     )
-    .map_err(|_| signal_error("invalid preconfirmation transaction"))?;
+    .map_err(|error| signal_error(&format!("invalid preconfirmation transaction: {error:?}")))?;
     let signature = Signature::try_from(view.signatures()[0].as_ref())
         .map_err(|_| signal_error("invalid preconfirmation signature"))?;
     let header = MessageHeader {
@@ -302,8 +357,8 @@ fn decode_frame(frame: &[u8], lookups: &LookupCache) -> Result<Option<ObservedTr
             signatures: view.signatures().iter().map(|sig| Signature::try_from(sig.as_ref()).expect("signature size")).collect(),
             message,
         },
-        meta: TransactionMeta { live_loaded_addresses: Some(loaded), source_v1_config, ..Default::default() },
-        raw_payload: json!({"feed":"preconfirmation", "slot":slot,"transactionIndex":tx_index,"status":"success"}).to_string(),
+        meta: TransactionMeta { live_loaded_addresses: Some(loaded), source_v1_config, preconfirmation_status: Some(frame[17]), ..Default::default() },
+        raw_payload: json!({"feed":"preconfirmation", "slot":slot,"transactionIndex":tx_index,"status":if frame[17] == 1 { "success" } else { "unknown" }}).to_string(),
         received_bytes: frame.len(),
     }))
 }
@@ -318,12 +373,46 @@ mod tests {
         bytes.extend_from_slice(&observed.slot.to_le_bytes());
         bytes.extend_from_slice(&5_u64.to_le_bytes());
         bytes.push(status);
-        bytes.extend(bincode::serialize(&observed.transaction).unwrap());
+        if crate::decode::terminal::present(observed) {
+            let VersionedMessage::Legacy(message) = &observed.transaction.message else {
+                panic!("inline fixture")
+            };
+            let mut wire = vec![
+                0x81,
+                message.header.num_required_signatures,
+                message.header.num_readonly_signed_accounts,
+                message.header.num_readonly_unsigned_accounts,
+            ];
+            wire.extend_from_slice(&7u32.to_le_bytes());
+            wire.extend_from_slice(message.recent_blockhash.as_ref());
+            wire.push(message.instructions.len() as u8);
+            wire.push(message.account_keys.len() as u8);
+            for key in &message.account_keys {
+                wire.extend_from_slice(key.as_ref());
+            }
+            wire.extend_from_slice(&100u64.to_le_bytes());
+            wire.extend_from_slice(&300_000u32.to_le_bytes());
+            for ix in &message.instructions {
+                wire.push(ix.program_id_index);
+                wire.push(ix.accounts.len() as u8);
+                wire.extend_from_slice(&(ix.data.len() as u16).to_le_bytes());
+            }
+            for ix in &message.instructions {
+                wire.extend_from_slice(&ix.accounts);
+                wire.extend_from_slice(&ix.data);
+            }
+            for signature in &observed.transaction.signatures {
+                wire.extend_from_slice(signature.as_ref());
+            }
+            bytes.extend(wire);
+        } else {
+            bytes.extend(bincode::serialize(&observed.transaction).unwrap());
+        }
         bytes
     }
 
     #[test]
-    fn binary_frames_preserve_signature_and_reject_invalid_or_unknown_status() {
+    fn binary_frames_preserve_signature_and_accept_unknown_status() {
         let (observed, wallet, _) = buy_fixture(DexKind::PumpFun, pump_fun::BUY_DISCRIMINATOR);
         let cache = LookupCache::default();
         let bytes = frame(&observed, 1);
@@ -332,7 +421,15 @@ mod tests {
         assert_eq!(decoded.slot, 100);
         assert_eq!(decoded.origin, SignalOrigin::Preconfirmation);
         assert!(TransactionDecoder::new(wallet).decode(&decoded).is_ok());
-        for status in [0, 2] {
+        let unknown = decode_frame(&frame(&observed, 2), &cache).unwrap().unwrap();
+        assert_eq!(unknown.meta.preconfirmation_status, Some(2));
+        assert_eq!(
+            serde_json::from_str::<Value>(&unknown.raw_payload).unwrap()["status"],
+            "unknown"
+        );
+        assert!(TransactionDecoder::new(wallet).decode(&unknown).is_ok());
+
+        for status in [0] {
             assert!(
                 decode_frame(&frame(&observed, status), &cache)
                     .unwrap()
@@ -447,7 +544,15 @@ mod tests {
     async fn websocket_subscription_filters_wallet_and_only_queues_eligible_successes() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = Url::parse(&format!("ws://{}/", listener.local_addr().unwrap())).unwrap();
-        let (observed, wallet, _) = buy_fixture(DexKind::PumpFun, pump_fun::BUY_DISCRIMINATOR);
+        let (observed, wallet) = crate::decode::terminal::tests::observation(
+            &crate::decode::terminal::tests::fixtures()[0],
+        );
+        let roundtrip = decode_frame(&frame(&observed, 1), &LookupCache::default())
+            .expect("fixture frame")
+            .expect("frame decoded");
+        TransactionDecoder::new(wallet)
+            .decode(&roundtrip)
+            .expect("fixture trade");
         let signature = observed.signature;
         let valid_frame = frame(&observed, 1);
         let failed_frame = frame(&observed, 0);
@@ -462,8 +567,8 @@ mod tests {
             };
             let request: Value = serde_json::from_str(&text).unwrap();
             assert_eq!(request["method"], "preconfSubscribe");
-            assert_eq!(request["params"][0]["includeBam"], false);
-            assert_eq!(request["params"][0]["failed"], false);
+            assert_eq!(request["params"][0]["includeBam"], true);
+            assert!(request["params"][0].get("failed").is_none());
             assert_eq!(
                 request["params"][0]["accountInclude"][0],
                 wallet.to_string()
@@ -501,6 +606,7 @@ mod tests {
             .unwrap();
         assert_eq!(queued.observed.signature, signature);
         assert_eq!(queued.observed.origin, SignalOrigin::Preconfirmation);
+        assert_eq!(queued.observed.meta.preconfirmation_status, Some(2));
         assert!(receiver.try_recv().is_err());
         let rows = store.status(10).await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -541,5 +647,60 @@ mod tests {
         assert!(error.contains("-32000"));
         assert!(!error.contains("secret-key"));
         server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn probe_includes_bam_and_all_statuses_without_journaling() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Url::parse(&format!("ws://{}/", listener.local_addr().unwrap())).unwrap();
+        let (observed, wallet, _) = buy_fixture(DexKind::PumpFun, pump_fun::BUY_DISCRIMINATOR);
+        let unknown = frame(&observed, 2);
+        let failed = frame(&observed, 0);
+        let success = frame(&observed, 1);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let WsMessage::Text(text) = ws.next().await.unwrap().unwrap() else {
+                panic!("expected request")
+            };
+            let request: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(request["params"][0]["includeBam"], true);
+            assert!(request["params"][0].get("failed").is_none());
+            ws.send(WsMessage::Text(
+                json!({"jsonrpc":"2.0","id":1,"result":1})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            for data in [unknown, failed, success] {
+                ws.send(WsMessage::Binary(data.into())).await.unwrap();
+            }
+            while ws.next().await.is_some() {}
+        });
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let lookups = LookupCache::default();
+        let stats = lookups.1.clone();
+        let mut source =
+            PreconfirmationSource::new(endpoint, "test-key", wallet, store.clone(), lookups);
+        source.observation_only = true;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let task = tokio::spawn(async move { source.session(&sender).await });
+        time::timeout(Duration::from_secs(3), async {
+            while stats.snapshot()["ready"] != 2 {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot["binary_received"], 3);
+        assert_eq!(snapshot["unknown_status_received"], 1);
+        assert_eq!(snapshot["failed_status_received"], 1);
+        assert_eq!(snapshot["status_ignored"], 1);
+        assert_eq!(snapshot["enqueued"], 0);
+        assert!(receiver.try_recv().is_err());
+        assert!(store.status(10).await.unwrap().is_empty());
+        task.abort();
+        server.abort();
     }
 }

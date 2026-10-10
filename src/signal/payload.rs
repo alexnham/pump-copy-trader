@@ -231,6 +231,7 @@ fn decode_meta(meta: grpc_solana::TransactionStatusMeta) -> Result<TransactionMe
         .map(|address| decode_pubkey(&address, "loaded address"))
         .collect::<Result<Vec<_>>>()?;
     Ok(TransactionMeta {
+        preconfirmation_status: None,
         source_v1_config: None,
         err,
         inner_instructions: None,

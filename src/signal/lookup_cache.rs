@@ -11,7 +11,10 @@ use std::{
 /// Learn immutable ALT index mappings from processed transaction metadata.
 /// A miss defers the trade; no RPC is made on the preconfirmation hot path.
 #[derive(Clone, Default)]
-pub(crate) struct LookupCache(Arc<Mutex<HashMap<Pubkey, Table>>>);
+pub(crate) struct LookupCache(
+    Arc<Mutex<HashMap<Pubkey, Table>>>,
+    pub(crate) Arc<super::diagnostics::Diagnostics>,
+);
 #[derive(Default)]
 struct Table {
     indices: HashMap<u8, Pubkey>,

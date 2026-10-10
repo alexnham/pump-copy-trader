@@ -6,6 +6,7 @@ use std::{
 
 use futures_util::{StreamExt, stream};
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::rpc_request::TokenAccountsFilter;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use tokio::sync::RwLock;
@@ -171,6 +172,71 @@ impl WalletBalanceCache {
         Ok(amount)
     }
 
+    /// Seed canonical token holdings before workers start, including unconfigured mints.
+    pub async fn preload_holdings(&self, rpc: &RpcClient, owner: Pubkey) -> Result<usize> {
+        let (legacy, token_2022) = tokio::try_join!(
+            rpc.get_token_accounts_by_owner(
+                &owner,
+                TokenAccountsFilter::ProgramId(spl_token::id())
+            ),
+            rpc.get_token_accounts_by_owner(
+                &owner,
+                TokenAccountsFilter::ProgramId(spl_token_2022::id())
+            ),
+        )
+        .map_err(|error| {
+            CopyTraderError::Execution(format!("failed to preload token holdings: {error}"))
+        })?;
+        let mut holdings = Vec::new();
+        for (program, accounts) in [
+            (spl_token::id(), legacy),
+            (spl_token_2022::id(), token_2022),
+        ] {
+            for account in accounts {
+                let data = serde_json::to_value(&account.account.data).map_err(|error| {
+                    CopyTraderError::Execution(format!("invalid token account data: {error}"))
+                })?;
+                let info = &data["parsed"]["info"];
+                let parse_key = |field: &str| {
+                    info[field]
+                        .as_str()
+                        .and_then(|value| value.parse::<Pubkey>().ok())
+                };
+                let Some(mint) = parse_key("mint") else {
+                    continue;
+                };
+                let Some(amount) = info["tokenAmount"]["amount"]
+                    .as_str()
+                    .and_then(|value| value.parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                let Ok(address) = account.pubkey.parse::<Pubkey>() else {
+                    continue;
+                };
+                if parse_key("owner") != Some(owner)
+                    || account.account.owner != program.to_string()
+                    || address != associated_token_address(&owner, &mint, &program)
+                {
+                    continue;
+                }
+                holdings.push((address, mint, amount));
+            }
+        }
+        let mut accounts = self.accounts.write().await;
+        let count = holdings.len();
+        for (address, mint, amount) in holdings {
+            // Do not replace balances already being refreshed or reserved by a running worker.
+            accounts.entry(address).or_insert(WatchedAccount {
+                asset: AssetId::Token(mint),
+                owner,
+                entry: Some(Entry { amount }),
+                revision: 0,
+            });
+        }
+        Ok(count)
+    }
+
     pub async fn refresh(&self, rpc: &RpcClient, owner: Pubkey, mints: &[Pubkey]) {
         self.watch(AssetId::NativeSol, owner, owner).await;
         for mint in mints {
@@ -229,6 +295,48 @@ mod tests {
 
     fn balance(amount: u64) -> serde_json::Value {
         json!({"context":{"slot":42},"value":{"amount":amount.to_string(),"decimals":6,"uiAmount":null,"uiAmountString":"0"}})
+    }
+
+    #[tokio::test]
+    async fn startup_preloads_unconfigured_holdings_for_both_programs() {
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let server = TestRpc::start(move |request| {
+            assert_eq!(request["method"], "getTokenAccountsByOwner");
+            let program: Pubkey = request["params"][1]["programId"].as_str().unwrap().parse().unwrap();
+            let address = associated_token_address(&owner, &mint, &program);
+            let account = |address: Pubkey, authority: Pubkey| json!({
+                "pubkey":address.to_string(),
+                "account":{"lamports":2039280,"owner":program.to_string(),"executable":false,"rentEpoch":0,
+                    "data":{"program":"spl-token","space":165,"parsed":{"type":"account","info":{
+                        "mint":mint.to_string(),"owner":authority.to_string(),
+                        "tokenAmount":{"amount":"12345","decimals":6,"uiAmount":null,"uiAmountString":"0.012345"}
+                    }}}}
+            });
+            json!({"context":{"slot":42},"value":[
+                account(address, owner),
+                account(Pubkey::new_unique(), owner),
+                account(Pubkey::new_unique(), Pubkey::new_unique())
+            ]})
+        }).await;
+        let transport = HttpTransport::new(&HttpConfig::default()).unwrap();
+        let rpc = transport.solana_rpc(&server.url);
+        let cache = WalletBalanceCache::default();
+        assert_eq!(cache.preload_holdings(&rpc, owner).await.unwrap(), 2);
+        for program in [spl_token::id(), spl_token_2022::id()] {
+            let address = associated_token_address(&owner, &mint, &program);
+            let (amount, hit, _, fetch_us) = cache
+                .get_or_fetch_measured(&rpc, AssetId::Token(mint), owner, address)
+                .await
+                .unwrap();
+            assert_eq!(amount, 12345);
+            assert!(hit);
+            assert_eq!(fetch_us, 0);
+            cache.invalidate(&address).await.unwrap();
+            assert_eq!(cache.get(&address).await, None);
+        }
+        assert_eq!(server.count("getTokenAccountsByOwner"), 2);
+        assert_eq!(server.count("getTokenAccountBalance"), 0);
     }
 
     #[tokio::test]

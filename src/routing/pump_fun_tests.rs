@@ -21,6 +21,7 @@ fn pump_fun_buy_rewrites_wallet_output_and_buy_arguments() {
     data[8..16].copy_from_slice(&7_u64.to_le_bytes());
     data[16..24].copy_from_slice(&9_u64.to_le_bytes());
     let source = SourceInstruction {
+        minimum_output_override: None,
         instruction: Instruction {
             program_id: PROGRAM_ID,
             accounts,
@@ -139,6 +140,7 @@ fn pump_fun_sell_rewrites_legacy_v2_and_v3_accounts_and_minimum_output() {
             accounts[11].pubkey = source_volume;
         }
         let source = SourceInstruction {
+            minimum_output_override: None,
             instruction: Instruction {
                 program_id: PROGRAM_ID,
                 accounts,
@@ -211,6 +213,7 @@ fn pump_fun_sell_rejects_mismatched_source_mint() {
     accounts[6] = AccountMeta::new(source_wallet, true);
     accounts[9].pubkey = spl_token::id();
     let source = SourceInstruction {
+        minimum_output_override: None,
         instruction: Instruction {
             program_id: PROGRAM_ID,
             accounts,
@@ -262,6 +265,7 @@ fn pump_fun_sell_v2_creates_copier_quote_ata_for_token_quote() {
     accounts[13] = AccountMeta::new(source_wallet, true);
     accounts[14].pubkey = base_ata;
     let source = SourceInstruction {
+        minimum_output_override: None,
         instruction: Instruction {
             program_id: PROGRAM_ID,
             accounts,
@@ -324,6 +328,7 @@ fn recorded_legacy_buy_rewrites_volume_pda_for_the_copier() {
         })
         .collect::<Vec<_>>();
     let source = SourceInstruction {
+        minimum_output_override: None,
         instruction: Instruction {
             program_id: PROGRAM_ID,
             accounts: accounts.clone(),
@@ -392,6 +397,7 @@ fn native_sol_delta_cannot_fund_arbitrary_v2_quote_tokens() {
     accounts[1].pubkey = mint;
     accounts[2].pubkey = Pubkey::from_str_const("8TiMkgvsrat9tM2esko8zVTt99LZLpefUM4SnZaziXaQ");
     let source = SourceInstruction {
+        minimum_output_override: None,
         instruction: Instruction {
             program_id: PROGRAM_ID,
             accounts,

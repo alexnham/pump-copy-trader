@@ -33,6 +33,8 @@ pub struct TradeIntent {
 
 #[derive(Clone, Debug)]
 pub struct SourceInstruction {
+    /// Explicit output floor for verified early wrappers whose fill is unknown.
+    pub minimum_output_override: Option<u64>,
     pub instruction: Instruction,
     pub source_wallet: Pubkey,
     pub wallet_token_accounts: Vec<(Pubkey, Pubkey, Pubkey)>,

@@ -12,7 +12,10 @@ use crate::{
 pub(super) fn decode(observed: &ObservedTransaction, wallet: Pubkey) -> Result<TradeIntent> {
     let defer =
         || CopyTraderError::Unsupported("preconfirmation requires processed metadata".into());
-    let context = DecodeContext::new(observed)?;
+    let context = match super::terminal::context(observed, wallet)? {
+        Some(context) => context,
+        None => DecodeContext::new(observed)?,
+    };
     source_route::require_pump_trade_with_context(&context)?;
     let message = &observed.transaction.message;
     let wallet_index = message
@@ -40,7 +43,9 @@ pub(super) fn decode(observed: &ObservedTransaction, wallet: Pubkey) -> Result<T
             .get(ix.program_id_index as usize)
             .is_none_or(|key| !allowed.contains(key))
     }) {
-        return Err(defer());
+        return Err(CopyTraderError::Unsupported(
+            "preconfirmation wrapper requires processed metadata".into(),
+        ));
     }
     let ix = context
         .instructions
@@ -72,12 +77,28 @@ pub(super) fn decode(observed: &ObservedTransaction, wallet: Pubkey) -> Result<T
             pump_fun::BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR => (1, 13, 14, 3, Some((2, 4, 15)), true),
             pump_fun::BUY_V3_DISCRIMINATOR => (1, 8, 9, 3, Some((2, 4, 10)), false),
             pump_fun::BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR => (1, 8, 9, 3, Some((2, 4, 10)), true),
-            _ => return Err(defer()), // Sells need the source's pre-sell position.
+            d if [
+                pump_fun::SELL_DISCRIMINATOR,
+                pump_fun::SELL_V2_DISCRIMINATOR,
+                pump_fun::SELL_V3_DISCRIMINATOR,
+            ]
+            .contains(&d) =>
+            {
+                return Err(CopyTraderError::Unsupported(
+                    "preconfirmation sell requires processed metadata".into(),
+                ));
+            }
+            _ => return Err(defer()),
         }
     } else {
         match discriminator {
             [102, 6, 61, 18, 1, 218, 235, 234] => (3, 1, 5, 11, Some((4, 12, 6)), false),
             [198, 46, 21, 82, 180, 217, 232, 112] => (3, 1, 5, 11, Some((4, 12, 6)), true),
+            [51, 230, 133, 164, 1, 127, 131, 173] => {
+                return Err(CopyTraderError::Unsupported(
+                    "preconfirmation sell requires processed metadata".into(),
+                ));
+            }
             _ => return Err(defer()),
         }
     };
@@ -113,7 +134,7 @@ pub(super) fn decode(observed: &ObservedTransaction, wallet: Pubkey) -> Result<T
     if input == 0 || output == 0 {
         return Err(defer());
     }
-    let source_instruction = source_route::extract_source_instruction_with_context(
+    let mut source_instruction = source_route::extract_source_instruction_with_context(
         observed,
         &context,
         wallet,
@@ -131,6 +152,9 @@ pub(super) fn decode(observed: &ObservedTransaction, wallet: Pubkey) -> Result<T
         })
     {
         return Err(defer());
+    }
+    if super::terminal::present(observed) {
+        source_instruction.minimum_output_override = Some(1);
     }
     Ok(TradeIntent {
         source_pool: source_route::extract_source_pool_with_context(&context),

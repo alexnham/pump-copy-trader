@@ -170,6 +170,7 @@ impl SignalSource for LaserstreamSource {
                         Ok(Some(observed)) => {
                             if let Some(lookups) = &self.lookups {
                                 lookups.observe(&observed)?;
+                                lookups.1.observe(observed.signature, false);
                             }
                             let signature = observed.signature.to_string();
                             let slot = observed.slot;

@@ -32,6 +32,18 @@ pub async fn run(cli: Cli) -> Result<()> {
     let store = Store::connect(&config.storage.database_url).await?;
     match cli.command {
         Command::Run => run_service(config, store).await,
+        Command::PreconfirmationDiagnostics { seconds, wallet } => {
+            let api_key = required_env("HELIUS_API_KEY")?;
+            PreconfirmationSource::new(
+                config.signal.preconfirmations.websocket_url.clone(),
+                &api_key,
+                wallet.unwrap_or(config.signal.wallet),
+                store,
+                LookupCache::default(),
+            )
+            .diagnose(seconds)
+            .await
+        }
         Command::Doctor => doctor(&config, &store).await,
         Command::Status { limit } => status(&store, limit).await,
         Command::Latency { limit } => latency(&store, limit).await,
@@ -141,6 +153,10 @@ async fn run_service(config: Arc<AppConfig>, store: Store) -> Result<()> {
         std::time::Duration::from_millis(config.routing.timeout_ms),
     ));
     let balance_cache = WalletBalanceCache::default();
+    let holdings = balance_cache
+        .preload_holdings(&execution_rpc, signer.pubkey())
+        .await?;
+    tracing::info!(holdings, "wallet token holdings preloaded");
     balance_cache
         .fetch(
             &execution_rpc,

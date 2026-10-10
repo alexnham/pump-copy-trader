@@ -32,8 +32,10 @@ cargo run -- --config config.toml run
 `[signal.preconfirmations]` is enabled by default and subscribes to Helius
 `preconfSubscribe` at `wss://beta.helius-rpc.com/`, using `HELIUS_API_KEY`. Set
 `enabled = false` to use LaserStream alone. `doctor` checks the subscription when
-enabled. The feed filters for the source wallet and successful leader executions;
-BAM and unknown-status signals are excluded. Reconnects use bounded backoff while
+enabled. The feed filters for the source wallet and includes Helius and BAM
+preconfirmations. Successful and unknown-status messages may trigger eligible buys;
+known failed messages are discarded before execution. BAM signals arrive before
+execution, so the source trade may subsequently fail. Reconnects use bounded backoff while
 LaserStream continues at `signal.commitment`.
 
 Early execution supports a single direct Pump.fun or PumpSwap buy with canonical
@@ -51,7 +53,9 @@ Signatures are deduplicated in the worker and reserved through the shared journa
 before submission. Preparation failures before reservation remain eligible for
 processed fallback. Preconfirmation observations are journaled with their origin;
 the later LaserStream observation supplies the processed slot without submitting
-another copy. Timing records include `preconfirmation = 1` for early signals.
+another copy. Timing records include `preconfirmation = 1` for early signals and
+`preconfirmation_status_unknown = 1` when execution used an unknown-status signal.
+Raw observation payloads retain `status: "unknown"` instead of claiming success.
 A successful leader execution is provisional and may not land on the canonical
 chain; a copy can execute even if its source later drops. Preconfirmations require
 an eligible Helius plan and coverage varies by leader. See the
@@ -571,3 +575,5 @@ Fanout journal writes now run on the ordered background writer; submission does 
 For new fanout copies, sender request and response timings follow the landed signature’s successful acknowledgment, rather than the slowest route. Identical signatures use the earliest successful acknowledgment and do not establish endpoint attribution. If the landed signature had no successful acknowledgment, these timings are unavailable. `fanout_all_requests_us` records the full fanout drain duration separately. Historical timings are unchanged.
 
 Astralane Iris fanout uses `provider = "astralane"`, `ASTRALANE_API_KEY` in a sensitive `api_key` header, and standard base64 `sendTransaction` requests. The configured New York HTTPS route tips 0.001 SOL, matching the documented free-tier minimum (5 TPS); higher tiers may allow lower tips. Health checks use `getHealth`. Credentials and provider error bodies are excluded from logged errors. Confirmation remains on the existing Solana RPC. See https://astralane.gitbook.io/docs/low-latency/submit-transactions and https://astralane.gitbook.io/docs/low-latency/send-txn-fee-tiers.
+
+Terminal preconfirmation supports only the verified 60-byte, 39-account single-route native-SOL Pump.fun exact-input buy. It copies directly through Pump.fun, without a Terminal fee. These copies use a **1 raw token unit minimum output**, as configured by the implementation: they do not provide the usual slippage-based price protection. The configured input budget still applies. Other Terminal layouts defer to processed. Accepted copies carry `terminal_preconfirmation: 1`; rejected frames log their signature and reason at INFO.

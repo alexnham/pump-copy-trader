@@ -275,6 +275,7 @@ pub(super) fn extract_source_instruction_with_context(
             );
         }
         found = Some(SourceInstruction {
+            minimum_output_override: None,
             instruction: Instruction {
                 program_id: program,
                 accounts: metas,
